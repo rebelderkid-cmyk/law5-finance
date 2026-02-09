@@ -67,6 +67,7 @@ const DEFAULT_PARAMS = {
   sensitivityVar: "trialToCustomerRate", bestMultiplier: 1.5, worstMultiplier: 0.5,
   vcExitYear: 5, vcExitMultiple: 10, vcDiscountRate: 0.40,
   dcfDiscountRate: 0.30, dcfTerminalGrowth: 0.03, dcfTerminalMultiple: 8, dcfMethod: "perpetuity",
+  opexEscalationRate: 0.15, scaleUpYear: 3, scaleUpMultiplier: 1.5,
   loanAmount: 0, loanInterestRate: 0.08, loanTermMonths: 36, loanStartMonth: 0,
   softwareCapex: 0,
 };
@@ -171,8 +172,15 @@ function computeModel(p, _skipSens = false) {
     const revStor = total * p.storageAdoptionRate * p.avgExtraStorageUnits * p.storageTopupMonthly * p.exchangeRate;
     const rev = revB + revP + revE + revSeats + revStor;
 
-    const sal = (p.team||[]).reduce((s,t) => s + (m >= t.m ? t.sal : 0), 0)
+    const baseSal = (p.team||[]).reduce((s,t) => s + (m >= t.m ? t.sal : 0), 0)
       + p.outsourceDevMonthly + p.outsourceAccountingMonthly + p.officeRent + p.utilities + p.miscOps;
+    // OpEx escalation: compound annual growth + scale-up jump at PMF year
+    const escRate = p.opexEscalationRate || 0;
+    const scaleYr = p.scaleUpYear || 0;
+    const scaleMult = p.scaleUpMultiplier || 1;
+    let opexMult = yr > 1 ? Math.pow(1 + escRate, yr - 1) : 1;
+    if (scaleYr > 0 && yr >= scaleYr) opexMult *= scaleMult;
+    const sal = baseSal * opexMult;
 
     const ovr = (p.costOverrides||{})[m] || {};
     const api = p.llmStrategy === "own" ? 0 : total * p.apiCostPerUser;
@@ -1537,6 +1545,17 @@ function ParamsTab({params:p,setParams:sp}) {
       {Array.from({length:Math.min(N,10)-1},(_,i)=>i+2).map(y=>(
         <PI key={y} label={`Y${y} Growth x`} value={rates[`y${y}`]??1} onChange={v=>setGrowth(`y${y}`,v)} step={0.05} min={0} max={10}/>
       ))}
+    </Card>
+    <Card title="OpEx Scaling">
+      <PI label="Annual Escalation %" value={p.opexEscalationRate||0} onChange={v=>u("opexEscalationRate",v)} step={0.05} min={0} max={2}/>
+      <div style={{fontSize:10,color:"var(--td)",marginTop:-4,marginBottom:8,paddingLeft:4}}>
+        Salaries, outsource & office costs grow {fmtP(p.opexEscalationRate||0)}/yr compounding
+      </div>
+      <SI label="Scale-Up Year (PMF)" value={p.scaleUpYear||0} onChange={v=>u("scaleUpYear",parseInt(v))} opts={[{v:0,l:"None"},...Array.from({length:N},(_,i)=>({v:i+1,l:`Year ${i+1}`}))]}/>
+      <PI label="Scale-Up Multiplier" value={p.scaleUpMultiplier||1} onChange={v=>u("scaleUpMultiplier",v)} step={0.1} min={1} max={5}/>
+      <div style={{fontSize:10,color:"var(--td)",marginTop:-4,marginBottom:8,paddingLeft:4}}>
+        At scale-up year, OpEx jumps {(p.scaleUpMultiplier||1)}x (aggressive hiring, expansion)
+      </div>
     </Card>
     {secs.map((sec,si)=>(<Card key={si} title={sec.t}>{sec.f.map((f,fi)=>f.type==="select"?(<SI key={fi} label={f.l} value={p[f.k]} onChange={v=>u(f.k,v)} opts={f.opts}/>):(<PI key={fi} label={f.l} value={p[f.k]} onChange={v=>u(f.k,v)} step={f.s} min={f.mn} max={f.mx}/>))}</Card>))}
   </div></div>);
