@@ -1,8 +1,8 @@
-import { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useMemo, useCallback } from "react";
 
 // ============================================================
-// LAW5 FINANCIAL MODEL — INTERACTIVE DASHBOARD v3
-// Fixes: Light mode, localStorage, LLM Budget editing, Cap Table layout
+// LAW5 FINANCIAL MODEL — INTERACTIVE DASHBOARD v4
+// + Investor Pitch tab, auto API Reserve, floating save bar
 // ============================================================
 
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -25,23 +25,24 @@ const DEFAULT_ROUNDS = [
   { name: "Series C", valuation: 2500000000, raise: 300000000, equity: 10 },
 ];
 
-// Fix 3: LLM budget moved into params so users can edit each line item
+// LLM budget — apiReserve is now auto-calculated, not manually set
 const DEFAULT_LLM_BUDGET = {
-  dev: 2000000, hardware: 2500000, apiReserve: 1000000,
+  dev: 2000000, hardware: 2500000,
   salaryOps: 2000000, software: 1000000, marketing: 1500000, buffer: 0,
 };
 
 const LLM_PRESETS = {
-  api:    { dev: 2000000, hardware: 0,       apiReserve: 1500000, salaryOps: 2000000, software: 1000000, marketing: 2000000, buffer: 1500000 },
-  own:    { dev: 2000000, hardware: 5000000, apiReserve: 0,       salaryOps: 2000000, software: 1000000, marketing: 0,       buffer: 0 },
-  hybrid: { dev: 2000000, hardware: 2500000, apiReserve: 1000000, salaryOps: 2000000, software: 1000000, marketing: 1500000, buffer: 0 },
+  api:    { dev: 2000000, hardware: 0,       salaryOps: 2000000, software: 1000000, marketing: 2000000, buffer: 1500000 },
+  own:    { dev: 2000000, hardware: 5000000, salaryOps: 2000000, software: 1000000, marketing: 0,       buffer: 0 },
+  hybrid: { dev: 2000000, hardware: 2500000, salaryOps: 2000000, software: 1000000, marketing: 1500000, buffer: 0 },
 };
 
 const DEFAULT_PARAMS = {
   exchangeRate: 33, displayCurrency: "THB",
   preMoneyValuation: 100000000, equityOffered: 10, raiseAmount: 10000000,
   llmStrategy: "hybrid",
-  llmBudget: { ...DEFAULT_LLM_BUDGET }, // Fix 3: user-editable budget
+  llmBudget: { ...DEFAULT_LLM_BUDGET },
+  apiReserveMonths: 6, // months of API reserve to budget for
   basicMonthly: 19, basicAnnual: 9, proMonthly: 29, proAnnual: 19,
   enterpriseMonthly: 149, enterpriseAnnual: 99, extraSeatMonthly: 19,
   storageTopupMonthly: 2, revenueStartMonth: 3,
@@ -67,6 +68,7 @@ const DEFAULT_PARAMS = {
 const STORAGE_KEY = "law5_params";
 
 const TABS = [
+  { id: "pitch", label: "Investor Pitch", icon: "🎯" },
   { id: "overview", label: "Overview", icon: "📊" },
   { id: "revenue", label: "Revenue", icon: "💰" },
   { id: "cost", label: "Costs", icon: "📉" },
@@ -84,6 +86,7 @@ const fmt = (v, c = "THB") => {
   if (v == null || isNaN(v)) return "—";
   const a = Math.abs(v); const s = v < 0 ? "-" : "";
   const p = c === "THB" ? "฿" : "$";
+  if (a >= 1e9) return s + p + (a/1e9).toFixed(2) + "B";
   if (a >= 1e6) return s + p + (a/1e6).toFixed(1) + "M";
   if (a >= 1e3) return s + p + (a/1e3).toFixed(0) + "K";
   return s + p + a.toFixed(0);
@@ -100,7 +103,6 @@ const cv = (thb, rate, cur) => cur === "USD" ? thb / rate : thb;
 // FINANCIAL ENGINE
 // ============================================================
 function computeModel(p, _skipSens = false) {
-  // Fix 3: read budget from params (user-editable) instead of hardcoded LLM_BUDGETS
   const budget = p.llmBudget || LLM_PRESETS[p.llmStrategy];
 
   const basicMoTHB = p.basicMonthly * p.exchangeRate;
@@ -151,7 +153,6 @@ function computeModel(p, _skipSens = false) {
     const revStor = total * p.storageAdoptionRate * p.avgExtraStorageUnits * p.storageTopupMonthly * p.exchangeRate;
     const rev = revB + revP + revE + revSeats + revStor;
 
-    // Salary from team array
     const sal = (p.team||[]).reduce((s,t) => s + (m >= t.m ? t.sal : 0), 0)
       + p.outsourceDevMonthly + p.outsourceAccountingMonthly + p.officeRent + p.utilities + p.miscOps;
 
@@ -163,7 +164,6 @@ function computeModel(p, _skipSens = false) {
     const mktY = yr===1 ? p.marketingBudgetY1 : p.marketingBudgetY1*(yr===2?1.5:2);
     const mktCalc = (p.llmStrategy==="own" && yr===1) ? 0 : mktY/12;
 
-    // Apply overrides if provided
     const mkt = ovr.mkt != null ? ovr.mkt : mktCalc;
     const devFinal = ovr.dev != null ? ovr.dev : devC;
     const apiFinal = ovr.api != null ? ovr.api : api;
@@ -184,6 +184,13 @@ function computeModel(p, _skipSens = false) {
       grossMargin: rev>0 ? gp/rev : 0, ebitda: rev-totalC, netIncome: rev-totalC,
     });
   }
+
+  // API Reserve auto-calculated: apiCostPerUser × Y1 end users × reserveMonths
+  const y1EndUsers = data[11].totalCustomers;
+  const apiReserveCalc = p.llmStrategy === "own" ? 0 : p.apiCostPerUser * y1EndUsers * (p.apiReserveMonths || 6);
+
+  // Full budget with computed apiReserve
+  const fullBudget = { ...budget, apiReserve: apiReserveCalc };
 
   let cash = p.raiseAmount, re = 0;
   data.forEach((d,i) => {
@@ -227,11 +234,9 @@ function computeModel(p, _skipSens = false) {
     { name: "Mr. Suphakit (Boat)", pct: 5 },
   ].map(f => ({ ...f, shares: Math.round(preShares*f.pct/100) }));
 
-  // Seed round
   const seedShares = Math.round(preShares * (p.equityOffered/100) / (1-p.equityOffered/100));
   let totShares = preShares + seedShares;
 
-  // Build rounds table: Seed + future rounds
   const rounds = [{ name: "Seed", valuation: p.preMoneyValuation, raise: p.raiseAmount, equity: p.equityOffered, newShares: seedShares, postShares: totShares, postMoney: p.preMoneyValuation + p.raiseAmount }];
 
   let cumulativeShares = totShares;
@@ -241,18 +246,25 @@ function computeModel(p, _skipSens = false) {
     rounds.push({ name: r.name, valuation: r.valuation, raise: r.raise, equity: r.equity, newShares: ns, postShares: cumulativeShares, postMoney: r.valuation + r.raise });
   });
 
-  // IPO row
   const ipoVal = p.ipoValuation || 3000000000;
   rounds.push({ name: "IPO", valuation: ipoVal, raise: 0, equity: 0, newShares: 0, postShares: cumulativeShares, postMoney: ipoVal });
 
-  // Calculate founder ownership after all rounds
   const founderSharesTotal = founders.reduce((s,f)=>s+f.shares, 0);
   const founderPctAtIPO = (founderSharesTotal / cumulativeShares * 100);
   const founderValueAtIPO = founderPctAtIPO / 100 * ipoVal;
 
+  // Investor returns at each round
+  const seedPct = seedShares / totShares * 100;
+  const investorReturns = rounds.map(r => {
+    const investorPctAtRound = seedShares / r.postShares * 100;
+    const investorValue = investorPctAtRound / 100 * r.postMoney;
+    const roi = investorValue / p.raiseAmount;
+    return { ...r, investorPct: investorPctAtRound, investorValue, roi };
+  });
+
   const capTable = {
-    founders, seedShares, totShares, rounds,
-    founderPctAtIPO, founderValueAtIPO, cumulativeShares, ipoVal,
+    founders, seedShares, totShares, rounds, investorReturns,
+    founderPctAtIPO, founderValueAtIPO, cumulativeShares, ipoVal, seedPct,
     post: [
       ...founders.map(f => ({ ...f, postPct: (f.shares/totShares*100).toFixed(2) })),
       { name: "Seed Investor(s)", shares: seedShares, pct: 0, postPct: (seedShares/totShares*100).toFixed(2) },
@@ -269,7 +281,7 @@ function computeModel(p, _skipSens = false) {
     return { scenario: sc, label: sc.charAt(0).toUpperCase()+sc.slice(1), mult, y1: adjModel.annuals[0].revenue, y2: adjModel.annuals[1].revenue, y3: adjModel.annuals[2].revenue, y3Cust: adjModel.annuals[2].customers };
   });
 
-  return { data, annuals, capTable, sens, budget };
+  return { data, annuals, capTable, sens, budget: fullBudget, apiReserveCalc };
 }
 
 // ============================================================
@@ -375,6 +387,159 @@ const SI = ({label,value,onChange,opts}) => (
 );
 
 // ============================================================
+// INVESTOR PITCH TAB
+// ============================================================
+function PitchTab({model:m, params:p}) {
+  const c = v => cv(v,p.exchangeRate,p.displayCurrency);
+  const cur = p.displayCurrency;
+  const [y1,y2,y3] = m.annuals;
+  const ct = m.capTable;
+  const b = m.budget;
+  const beM = m.data.findIndex(d=>d.ebitda>0);
+  const last = m.data[35];
+  const y3ARR = last.totalRevenue * 12;
+  const totalCostY1 = y1.totalCost;
+  const runway = Math.round(p.raiseAmount / (totalCostY1/12));
+
+  return (
+    <div className="tc">
+      <div style={{textAlign:"center",marginBottom:28}}>
+        <div style={{fontSize:32,fontWeight:800,background:"linear-gradient(135deg,var(--ac),var(--pp))",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",marginBottom:4}}>LAW5</div>
+        <div style={{fontSize:14,color:"var(--td)",letterSpacing:1}}>AI-Powered Legal Tech SaaS — Investor Financial Summary</div>
+      </div>
+
+      {/* The Ask */}
+      <Card title="The Investment">
+        <div className="mg" style={{gridTemplateColumns:"repeat(4,1fr)"}}>
+          <Metric label="Raising" value={fmt(c(p.raiseAmount),cur)} color="var(--ac)"/>
+          <Metric label="Pre-Money" value={fmt(c(p.preMoneyValuation),cur)}/>
+          <Metric label="Equity Offered" value={`${p.equityOffered}%`} color="var(--pp)"/>
+          <Metric label="Post-Money" value={fmt(c(p.preMoneyValuation+p.raiseAmount),cur)} color="var(--gn)"/>
+        </div>
+      </Card>
+
+      {/* Financial Highlights */}
+      <Card title="3-Year Financial Projection">
+        <div className="mg" style={{gridTemplateColumns:"repeat(3,1fr)"}}>
+          <div className="mc" style={{borderLeft:"3px solid var(--ac)"}}>
+            <div className="mc-l">Year 1</div>
+            <div className="mc-v" style={{color:"var(--ac)"}}>{fmt(c(y1.revenue),cur)}</div>
+            <div className="mc-s">{fmtN(y1.customers)} customers | EBITDA: {fmt(c(y1.ebitda),cur)}</div>
+          </div>
+          <div className="mc" style={{borderLeft:"3px solid var(--gn)"}}>
+            <div className="mc-l">Year 2</div>
+            <div className="mc-v" style={{color:"var(--gn)"}}>{fmt(c(y2.revenue),cur)}</div>
+            <div className="mc-s">{fmtN(y2.customers)} customers | EBITDA: {fmt(c(y2.ebitda),cur)}</div>
+          </div>
+          <div className="mc" style={{borderLeft:"3px solid var(--pp)"}}>
+            <div className="mc-l">Year 3</div>
+            <div className="mc-v" style={{color:"var(--pp)"}}>{fmt(c(y3.revenue),cur)}</div>
+            <div className="mc-s">{fmtN(y3.customers)} customers | EBITDA: {fmt(c(y3.ebitda),cur)}</div>
+          </div>
+        </div>
+        <div className="g2" style={{marginTop:12}}>
+          <div>
+            <Bar data={m.data.map(d=>c(d.totalRevenue))} color="var(--gn)" h={90}/>
+            <div className="cl"><span>M1</span><span>M12</span><span>M24</span><span>M36</span></div>
+            <div style={{textAlign:"center",fontSize:11,color:"var(--td)",marginTop:4}}>Monthly Revenue</div>
+          </div>
+          <div>
+            <Bar data={m.data.map(d=>c(d.cash))} h={90}/>
+            <div className="cl"><span>M1</span><span>M12</span><span>M24</span><span>M36</span></div>
+            <div style={{textAlign:"center",fontSize:11,color:"var(--td)",marginTop:4}}>Cash Balance</div>
+          </div>
+        </div>
+      </Card>
+
+      {/* Key Metrics */}
+      <Card title="Key Metrics">
+        <div className="mg" style={{gridTemplateColumns:"repeat(4,1fr)"}}>
+          <Metric label="Y3 ARR" value={fmt(c(y3ARR),cur)} color="var(--gn)"/>
+          <Metric label="Y3 Customers" value={fmtN(last.totalCustomers)} color="var(--ac)"/>
+          <Metric label="Break-Even" value={beM>=0?`Month ${beM+1}`:"Beyond M36"} sub={beM>=0?m.data[beM].label:""} color={beM>=0?"var(--gn)":"var(--yl)"}/>
+          <Metric label="Cash Runway" value={`${runway} months`} sub="At Y1 burn rate" color="var(--yl)"/>
+        </div>
+        <Tbl headers={["","Year 1","Year 2","Year 3"]} rows={[
+          ["Revenue",fmt(c(y1.revenue),cur),fmt(c(y2.revenue),cur),fmt(c(y3.revenue),cur)],
+          ["Gross Margin",y1.revenue>0?fmtP(y1.grossProfit/y1.revenue):"—",y2.revenue>0?fmtP(y2.grossProfit/y2.revenue):"—",y3.revenue>0?fmtP(y3.grossProfit/y3.revenue):"—"],
+          ["EBITDA",fmt(c(y1.ebitda),cur),fmt(c(y2.ebitda),cur),fmt(c(y3.ebitda),cur)],
+          ["Customers",fmtN(y1.customers),fmtN(y2.customers),fmtN(y3.customers)],
+          ["ARR (MRRx12)",fmt(c(y1.mrr*12),cur),fmt(c(y2.mrr*12),cur),fmt(c(y3ARR),cur)],
+          ["Cash",fmt(c(y1.cash),cur),fmt(c(y2.cash),cur),fmt(c(y3.cash),cur)],
+        ]} hl/>
+      </Card>
+
+      {/* Use of Funds */}
+      <Card title="Use of Funds">
+        <div className="g2">
+          <Pie data={[
+            {label:"Development",value:b.dev,color:"#6366f1"},
+            {label:"LLM Hardware",value:b.hardware,color:"#f59e0b"},
+            {label:"API Reserve",value:b.apiReserve,color:"#10b981"},
+            {label:"Salary & Ops",value:b.salaryOps,color:"#3b82f6"},
+            {label:"Software",value:b.software,color:"#8b5cf6"},
+            {label:"Marketing",value:b.marketing,color:"#ec4899"},
+            {label:"Buffer",value:b.buffer,color:"#6b7280"},
+          ].filter(i=>i.value>0)} size={170}/>
+          <Tbl headers={["Category","Amount","% of Total"]} rows={[
+            ...Object.entries({Development:b.dev,Hardware:b.hardware,"API Reserve":b.apiReserve,"Salary & Ops":b.salaryOps,Software:b.software,Marketing:b.marketing,Buffer:b.buffer}).filter(([,v])=>v>0).map(([k,v])=>{
+              const tot=Object.values(b).reduce((s,x)=>s+x,0);
+              return [k,fmt(c(v),cur),fmtP(v/tot)];
+            }),
+            ["Total",fmt(c(Object.values(b).reduce((s,x)=>s+x,0)),cur),"100%"],
+          ]} hl/>
+        </div>
+      </Card>
+
+      {/* Investor Return — the key section */}
+      <Card title="Investor Return at Each Exit">
+        <div style={{marginBottom:14,padding:"12px 16px",background:"var(--bg3)",borderRadius:10,fontSize:12,color:"var(--td)"}}>
+          Seed investor puts in <strong style={{color:"var(--ac)"}}>{fmt(c(p.raiseAmount),cur)}</strong> for <strong style={{color:"var(--ac)"}}>{p.equityOffered}%</strong> equity ({fmtN(ct.seedShares)} shares). Here is the projected return at each funding milestone:
+        </div>
+        <Tbl headers={["Exit Point","Valuation","Investor %","Investor Value","ROI","Multiple"]} rows={ct.investorReturns.map(r=>[
+          r.name,
+          fmt(c(r.postMoney),cur),
+          r.investorPct.toFixed(2)+"%",
+          fmt(c(r.investorValue),cur),
+          r.roi>1?"+"+fmtP(r.roi-1):"−"+fmtP(1-r.roi),
+          r.roi.toFixed(1)+"x",
+        ])} hl/>
+        <div className="mg" style={{marginTop:16,gridTemplateColumns:"repeat(4,1fr)"}}>
+          {ct.investorReturns.filter(r=>r.name!=="Seed").map((r,i)=>(
+            <div key={i} className="mc" style={{borderTop:`3px solid ${["var(--ac)","var(--gn)","var(--pp)","var(--yl)"][i]}`}}>
+              <div className="mc-l">{r.name}</div>
+              <div className="mc-v" style={{color:["var(--ac)","var(--gn)","var(--pp)","var(--yl)"][i],fontSize:26}}>{r.roi.toFixed(1)}x</div>
+              <div className="mc-s">{fmt(c(r.investorValue),cur)}</div>
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      {/* Path to IPO summary */}
+      <Card title="Valuation Journey — Seed to IPO">
+        <div style={{display:"flex",alignItems:"center",gap:0,overflow:"auto",padding:"12px 0"}}>
+          {ct.rounds.map((r,i)=>(
+            <div key={i} style={{display:"flex",alignItems:"center"}}>
+              <div style={{textAlign:"center",minWidth:100}}>
+                <div style={{fontSize:11,color:"var(--td)",marginBottom:4}}>{r.name}</div>
+                <div style={{width:48,height:48,borderRadius:"50%",background:i===ct.rounds.length-1?"var(--gn)":"var(--ac)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto",color:"#fff",fontSize:11,fontWeight:700}}>{fmt(c(r.postMoney),cur)}</div>
+                <div style={{fontSize:10,color:"var(--td)",marginTop:4}}>{r.equity>0?`${r.equity}% dilution`:""}</div>
+              </div>
+              {i<ct.rounds.length-1&&<div style={{width:40,height:2,background:"var(--bd)",flexShrink:0}}/>}
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      {/* Bottom line */}
+      <div style={{textAlign:"center",padding:"20px 0",fontSize:13,color:"var(--td)"}}>
+        All projections based on current model parameters. Adjust in Settings tab.
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
 // TAB VIEWS
 // ============================================================
 function OverviewTab({model:m, params:p}) {
@@ -430,14 +595,10 @@ function OverviewTab({model:m, params:p}) {
   );
 }
 
-// Feature 1: Revenue with user % breakdown
 function RevenueTab({model:m,params:p,setParams:sp}) {
   const c=v=>cv(v,p.exchangeRate,p.displayCurrency); const cur=p.displayCurrency;
   const last12=m.data[11]; const last24=m.data[23]; const last36=m.data[35];
-  const tierPct=(d)=>{
-    const t=d.totalCustomers||1;
-    return {b:((d.bM+d.bA)/t*100).toFixed(1),p:((d.pM+d.pA)/t*100).toFixed(1),e:((d.eM+d.eA)/t*100).toFixed(1)};
-  };
+  const tierPct=(d)=>{const t=d.totalCustomers||1;return {b:((d.bM+d.bA)/t*100).toFixed(1),p:((d.pM+d.pA)/t*100).toFixed(1),e:((d.eM+d.eA)/t*100).toFixed(1)};};
   return (
     <div className="tc">
       <div className="st">Revenue Model</div>
@@ -447,7 +608,6 @@ function RevenueTab({model:m,params:p,setParams:sp}) {
         <Metric label="Enterprise" value={`$${p.enterpriseMonthly}/mo`} sub={`Annual: $${p.enterpriseAnnual}/mo`}/>
         <Metric label="Storage" value={`$${p.storageTopupMonthly}/50GB`} sub={`${fmtP(p.storageAdoptionRate)} adopt`}/>
       </div>
-
       <Card title="Customer Mix by Tier (End of Year)">
         <div className="g2">
           <Pie data={[
@@ -455,20 +615,16 @@ function RevenueTab({model:m,params:p,setParams:sp}) {
             {label:`Pro (${fmtN(last36.pM+last36.pA)})`,value:last36.pM+last36.pA||1,color:"#6366f1"},
             {label:`Enterprise (${fmtN(last36.eM+last36.eA)})`,value:last36.eM+last36.eA||1,color:"#8b5cf6"},
           ]} size={160}/>
-          <Tbl headers={["Tier","Y1 Users","Y1 %","Y2 Users","Y2 %","Y3 Users","Y3 %"]} rows={[
+          <Tbl headers={["Tier","Y1","Y1%","Y2","Y2%","Y3","Y3%"]} rows={[
             ["Basic",fmtN(last12.bM+last12.bA),tierPct(last12).b+"%",fmtN(last24.bM+last24.bA),tierPct(last24).b+"%",fmtN(last36.bM+last36.bA),tierPct(last36).b+"%"],
             ["Pro",fmtN(last12.pM+last12.pA),tierPct(last12).p+"%",fmtN(last24.pM+last24.pA),tierPct(last24).p+"%",fmtN(last36.pM+last36.pA),tierPct(last36).p+"%"],
-            ["Enterprise",fmtN(last12.eM+last12.eA),tierPct(last12).e+"%",fmtN(last24.eM+last24.eA),tierPct(last24).e+"%",fmtN(last36.eM+last36.eA),tierPct(last36).e+"%"],
+            ["Ent",fmtN(last12.eM+last12.eA),tierPct(last12).e+"%",fmtN(last24.eM+last24.eA),tierPct(last24).e+"%",fmtN(last36.eM+last36.eA),tierPct(last36).e+"%"],
             ["Total",fmtN(last12.totalCustomers),"100%",fmtN(last24.totalCustomers),"100%",fmtN(last36.totalCustomers),"100%"],
           ]} hl/>
         </div>
       </Card>
-
       <Card title="Monthly Revenue — Year 1">
-        <Tbl headers={["Month","Basic","Pro","Enterprise","Seats","Storage","Total","Cust","B%","P%","E%"]} rows={m.data.filter(d=>d.year===1).map(d=>{
-          const tp=tierPct(d);
-          return [d.label,fmt(c(d.revB),cur),fmt(c(d.revP),cur),fmt(c(d.revE),cur),fmt(c(d.revSeats),cur),fmt(c(d.revStor),cur),fmt(c(d.totalRevenue),cur),fmtN(d.totalCustomers),tp.b+"%",tp.p+"%",tp.e+"%"];
-        })}/>
+        <Tbl headers={["Month","Basic","Pro","Ent","Seats","Storage","Total","Cust"]} rows={m.data.filter(d=>d.year===1).map(d=>[d.label,fmt(c(d.revB),cur),fmt(c(d.revP),cur),fmt(c(d.revE),cur),fmt(c(d.revSeats),cur),fmt(c(d.revStor),cur),fmt(c(d.totalRevenue),cur),fmtN(d.totalCustomers)])}/>
       </Card>
       <Card title="ARR Progression">
         <Tbl headers={["","Year 1","Year 2","Year 3"]} rows={[
@@ -485,10 +641,7 @@ function RevenueTab({model:m,params:p,setParams:sp}) {
         ]}/>
       </Card>
       <div className="g2">
-        <Card title="Customer Growth">
-          <Bar data={m.data.map(d=>d.totalCustomers)} h={80}/>
-          <div className="cl"><span>M1</span><span>M36</span></div>
-        </Card>
+        <Card title="Customer Growth"><Bar data={m.data.map(d=>d.totalCustomers)} h={80}/><div className="cl"><span>M1</span><span>M36</span></div></Card>
         <Card title="Revenue Mix Y3">
           <Pie data={[
             {label:"Basic",value:m.data.filter(d=>d.year===3).reduce((s,d)=>s+d.revB,0)||1,color:"#3b82f6"},
@@ -502,7 +655,6 @@ function RevenueTab({model:m,params:p,setParams:sp}) {
   );
 }
 
-// Feature 2+3+7: Cost with inline config + editable LLM budget + dynamic monthly overrides
 function CostTab({model:m,params:p,setParams:sp}) {
   const c=v=>cv(v,p.exchangeRate,p.displayCurrency); const cur=p.displayCurrency;
   const u=(k,v)=>sp(pr=>({...pr,[k]:v}));
@@ -513,30 +665,25 @@ function CostTab({model:m,params:p,setParams:sp}) {
   const avgChurn=(p.basicChurnMonthly+p.proChurnMonthly)/2;
   const ltv=avgChurn>0?arpu/avgChurn:0;
   const budget = p.llmBudget || LLM_PRESETS[p.llmStrategy];
+  const apiReserve = m.apiReserveCalc;
+  const fullBudget = m.budget;
 
   const updateBudget=(key,val)=>{
     sp(pr=>({...pr, llmBudget:{...(pr.llmBudget||LLM_PRESETS[pr.llmStrategy]),[key]:parseFloat(val)||0}}));
   };
-
   const applyPreset=(strategy)=>{
     sp(pr=>({...pr, llmStrategy:strategy, llmBudget:{...LLM_PRESETS[strategy]}}));
   };
-
   const setOverride=(month,key,val)=>{
     sp(pr=>{
       const ovr={...(pr.costOverrides||{})};
       if(!ovr[month]) ovr[month]={};
-      if(val===""||val==null){
-        delete ovr[month][key];
-        if(Object.keys(ovr[month]).length===0) delete ovr[month];
-      } else {
-        ovr[month]={...ovr[month],[key]:parseFloat(val)||0};
-      }
+      if(val===""||val==null){delete ovr[month][key];if(Object.keys(ovr[month]).length===0) delete ovr[month];}
+      else ovr[month]={...ovr[month],[key]:parseFloat(val)||0};
       return {...pr,costOverrides:ovr};
     });
   };
-
-  const budgetTotal = Object.values(budget).reduce((s,v)=>s+v,0);
+  const budgetTotal = Object.values(fullBudget).reduce((s,v)=>s+v,0);
 
   return (
     <div className="tc">
@@ -545,17 +692,23 @@ function CostTab({model:m,params:p,setParams:sp}) {
       <Card title="LLM Strategy & Budget">
         <div style={{display:"flex",gap:8,marginBottom:14}}>
           {["api","own","hybrid"].map(s=>(
-            <button key={s} className="ct" style={{margin:0,padding:"6px 16px",background:p.llmStrategy===s?"var(--ac)":"var(--bg3)",color:p.llmStrategy===s?"#fff":"var(--tx)",border:p.llmStrategy===s?"none":"1px solid var(--bd)"}} onClick={()=>applyPreset(s)}>
-              {s.toUpperCase()}
-            </button>
+            <button key={s} className="ct" style={{margin:0,padding:"6px 16px",background:p.llmStrategy===s?"var(--ac)":"var(--bg3)",color:p.llmStrategy===s?"#fff":"var(--tx)",border:p.llmStrategy===s?"none":"1px solid var(--bd)"}} onClick={()=>applyPreset(s)}>{s.toUpperCase()}</button>
           ))}
         </div>
-        <div style={{fontSize:11,color:"var(--td)",marginBottom:12}}>Switching strategy resets budget to preset. Edit individual items below.</div>
         <div className="g2">
           <div>
             <PI label="Development (THB)" value={budget.dev} onChange={v=>updateBudget("dev",v)} step={100000}/>
             <PI label="Hardware (THB)" value={budget.hardware} onChange={v=>updateBudget("hardware",v)} step={100000}/>
-            <PI label="API Reserve (THB)" value={budget.apiReserve} onChange={v=>updateBudget("apiReserve",v)} step={100000}/>
+            {/* API Reserve: auto-calculated, read-only */}
+            <div className="pr">
+              <label className="pl">API Reserve (auto)</label>
+              <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:"var(--gn)",fontWeight:600}}>{fmtF(apiReserve,cur)}</span>
+            </div>
+            <div style={{fontSize:10,color:"var(--td)",marginTop:-4,marginBottom:6,paddingLeft:4}}>
+              = {fmtN(m.data[11].totalCustomers)} users x ฿{fmtN(p.apiCostPerUser)}/user x {p.apiReserveMonths} mo
+            </div>
+            <PI label="API Cost/User/Mo (THB)" value={p.apiCostPerUser} onChange={v=>u("apiCostPerUser",v)} step={10}/>
+            <PI label="Reserve Months" value={p.apiReserveMonths||6} onChange={v=>u("apiReserveMonths",v)} step={1} min={1} max={24}/>
             <PI label="Salary & Ops (THB)" value={budget.salaryOps} onChange={v=>updateBudget("salaryOps",v)} step={100000}/>
             <PI label="Software (THB)" value={budget.software} onChange={v=>updateBudget("software",v)} step={100000}/>
             <PI label="Marketing (THB)" value={budget.marketing} onChange={v=>updateBudget("marketing",v)} step={100000}/>
@@ -566,13 +719,13 @@ function CostTab({model:m,params:p,setParams:sp}) {
           </div>
           <div>
             <Pie data={[
-              {label:"Development",value:budget.dev,color:"#6366f1"},
-              {label:"Hardware",value:budget.hardware,color:"#f59e0b"},
-              {label:"API Reserve",value:budget.apiReserve,color:"#10b981"},
-              {label:"Salary & Ops",value:budget.salaryOps,color:"#3b82f6"},
-              {label:"Software",value:budget.software,color:"#8b5cf6"},
-              {label:"Marketing",value:budget.marketing,color:"#ec4899"},
-              {label:"Buffer",value:budget.buffer,color:"#6b7280"},
+              {label:"Development",value:fullBudget.dev,color:"#6366f1"},
+              {label:"Hardware",value:fullBudget.hardware,color:"#f59e0b"},
+              {label:"API Reserve",value:fullBudget.apiReserve,color:"#10b981"},
+              {label:"Salary & Ops",value:fullBudget.salaryOps,color:"#3b82f6"},
+              {label:"Software",value:fullBudget.software,color:"#8b5cf6"},
+              {label:"Marketing",value:fullBudget.marketing,color:"#ec4899"},
+              {label:"Buffer",value:fullBudget.buffer,color:"#6b7280"},
             ].filter(i=>i.value>0)} size={170}/>
           </div>
         </div>
@@ -581,7 +734,6 @@ function CostTab({model:m,params:p,setParams:sp}) {
       <Card title="Operational Costs">
         <div className="g2">
           <div>
-            <PI label="API Cost/User/Mo (THB)" value={p.apiCostPerUser} onChange={v=>u("apiCostPerUser",v)} step={10}/>
             <PI label="Marketing Budget Y1 (THB)" value={p.marketingBudgetY1} onChange={v=>u("marketingBudgetY1",v)} step={100000}/>
           </div>
           <div>
@@ -592,19 +744,6 @@ function CostTab({model:m,params:p,setParams:sp}) {
             <PI label="Misc Ops" value={p.miscOps} onChange={v=>u("miscOps",v)} step={1000}/>
           </div>
         </div>
-      </Card>
-
-      <Card title="LLM Strategy Comparison (Presets)">
-        <Tbl headers={["","API Only","Own LLM","Hybrid"]} rows={[
-          ["Development",...["api","own","hybrid"].map(s=>fmt(c(LLM_PRESETS[s].dev),cur))],
-          ["Hardware",...["api","own","hybrid"].map(s=>fmt(c(LLM_PRESETS[s].hardware),cur))],
-          ["API Reserve",...["api","own","hybrid"].map(s=>fmt(c(LLM_PRESETS[s].apiReserve),cur))],
-          ["Salary & Ops",...["api","own","hybrid"].map(s=>fmt(c(LLM_PRESETS[s].salaryOps),cur))],
-          ["Software",...["api","own","hybrid"].map(s=>fmt(c(LLM_PRESETS[s].software),cur))],
-          ["Marketing",...["api","own","hybrid"].map(s=>fmt(c(LLM_PRESETS[s].marketing),cur))],
-          ["Buffer",...["api","own","hybrid"].map(s=>fmt(c(LLM_PRESETS[s].buffer),cur))],
-          ["Total",...["api","own","hybrid"].map(s=>fmt(c(Object.values(LLM_PRESETS[s]).reduce((a,b)=>a+b,0)),cur))],
-        ]} hl/>
       </Card>
 
       <Card title="Unit Economics (Month 12)">
@@ -622,7 +761,7 @@ function CostTab({model:m,params:p,setParams:sp}) {
         </div>
         <div className="tw" style={{fontSize:11}}>
           <table>
-            <thead><tr><th>Month</th><th>Mkt (auto)</th><th>Mkt Override</th><th>Dev (auto)</th><th>Dev Override</th><th>API (auto)</th><th>API Override</th><th>Total Cost</th></tr></thead>
+            <thead><tr><th>Month</th><th>Mkt</th><th>Override</th><th>Dev</th><th>Override</th><th>API</th><th>Override</th><th>Total</th></tr></thead>
             <tbody>
               {m.data.filter(d=>d.year===viewYear).map(d=>{
                 const ovr=(p.costOverrides||{})[d.month]||{};
@@ -642,7 +781,6 @@ function CostTab({model:m,params:p,setParams:sp}) {
             </tbody>
           </table>
         </div>
-        <div style={{marginTop:6,fontSize:11,color:"var(--td)"}}>Leave blank to use auto-calculated values. Enter a number to override for that month.</div>
       </Card>
 
       <Card title={`Monthly Costs — Year ${viewYear}`}>
@@ -654,7 +792,6 @@ function CostTab({model:m,params:p,setParams:sp}) {
   );
 }
 
-// Feature 3: Marketing with inline config
 function MarketingTab({model:m,params:p,setParams:sp}) {
   const c=v=>cv(v,p.exchangeRate,p.displayCurrency); const cur=p.displayCurrency;
   const u=(k,v)=>sp(pr=>({...pr,[k]:v}));
@@ -663,7 +800,6 @@ function MarketingTab({model:m,params:p,setParams:sp}) {
   return (
     <div className="tc">
       <div className="st">Marketing Model</div>
-
       <Card title="Budget & Channel Allocation">
         <div className="g2">
           <div>
@@ -673,17 +809,14 @@ function MarketingTab({model:m,params:p,setParams:sp}) {
             <PI label="Word of Mouth %" value={p.wordOfMouthPct} onChange={v=>u("wordOfMouthPct",v)} step={0.05} max={1}/>
             <PI label="Content Marketing %" value={p.contentMarketingPct} onChange={v=>u("contentMarketingPct",v)} step={0.05} max={1}/>
           </div>
-          <div>
-            <Pie data={[
-              {label:`Sales (${fmt(c(p.marketingBudgetY1*p.salesOutreachPct),cur)})`,value:p.salesOutreachPct,color:"#3b82f6"},
-              {label:`LINE (${fmt(c(p.marketingBudgetY1*p.lineAffiliationPct),cur)})`,value:p.lineAffiliationPct,color:"#10b981"},
-              {label:`WoM (${fmt(c(p.marketingBudgetY1*p.wordOfMouthPct),cur)})`,value:p.wordOfMouthPct,color:"#f59e0b"},
-              {label:`Content (${fmt(c(p.marketingBudgetY1*p.contentMarketingPct),cur)})`,value:p.contentMarketingPct,color:"#8b5cf6"},
-            ]} size={160}/>
-          </div>
+          <Pie data={[
+            {label:`Sales (${fmt(c(p.marketingBudgetY1*p.salesOutreachPct),cur)})`,value:p.salesOutreachPct,color:"#3b82f6"},
+            {label:`LINE (${fmt(c(p.marketingBudgetY1*p.lineAffiliationPct),cur)})`,value:p.lineAffiliationPct,color:"#10b981"},
+            {label:`WoM (${fmt(c(p.marketingBudgetY1*p.wordOfMouthPct),cur)})`,value:p.wordOfMouthPct,color:"#f59e0b"},
+            {label:`Content (${fmt(c(p.marketingBudgetY1*p.contentMarketingPct),cur)})`,value:p.contentMarketingPct,color:"#8b5cf6"},
+          ]} size={160}/>
         </div>
       </Card>
-
       <Card title="Conversion Funnel — Drives Revenue">
         <div className="g2">
           <div>
@@ -702,12 +835,11 @@ function MarketingTab({model:m,params:p,setParams:sp}) {
               </div>
             ))}
             <div style={{marginTop:10,fontSize:12,color:"var(--gn)",textAlign:"center",fontWeight:500}}>
-              Funnel output: {fmtN(cust)}/mo &rarr; Basic {fmtP(p.tierSplitBasic)} | Pro {fmtP(p.tierSplitPro)} | Ent {fmtP(p.tierSplitEnterprise)}
+              Funnel: {fmtN(cust)}/mo &rarr; B {fmtP(p.tierSplitBasic)} | P {fmtP(p.tierSplitPro)} | E {fmtP(p.tierSplitEnterprise)}
             </div>
           </div>
         </div>
       </Card>
-
       <Card title="Sales Team">
         <div className="g2">
           <div>
@@ -715,38 +847,22 @@ function MarketingTab({model:m,params:p,setParams:sp}) {
             <PI label="Cost/Rep/Mo (THB)" value={p.salesRepCostMonthly} onChange={v=>u("salesRepCostMonthly",v)} step={5000}/>
             <PI label="Deals/Rep/Mo" value={p.dealsPerRepPerMonth} onChange={v=>u("dealsPerRepPerMonth",v)} step={1}/>
           </div>
-          <Tbl headers={["Metric","Value"]} rows={[
-            ["Total Reps",p.salesRepsY1],
-            ["Total Deals/Mo",p.salesRepsY1*p.dealsPerRepPerMonth],
-            ["Annual Cost",fmt(c(p.salesRepsY1*p.salesRepCostMonthly*12),cur)],
-          ]}/>
+          <Tbl headers={["Metric","Value"]} rows={[["Total Reps",p.salesRepsY1],["Total Deals/Mo",p.salesRepsY1*p.dealsPerRepPerMonth],["Annual Cost",fmt(c(p.salesRepsY1*p.salesRepCostMonthly*12),cur)]]}/>
         </div>
       </Card>
     </div>
   );
 }
 
-// Feature 4: Headcount with add/remove + inline config
 function HeadcountTab({model:m,params:p,setParams:sp}) {
   const c=v=>cv(v,p.exchangeRate,p.displayCurrency); const cur=p.displayCurrency;
   const u=(k,v)=>sp(pr=>({...pr,[k]:v}));
   const team=p.team||[];
-
-  const updateMember=(id,key,val)=>{
-    sp(pr=>({...pr,team:(pr.team||[]).map(t=>t.id===id?{...t,[key]:val}:t)}));
-  };
-  const removeMember=(id)=>{
-    sp(pr=>({...pr,team:(pr.team||[]).filter(t=>t.id!==id)}));
-  };
-  const addMember=()=>{
-    const maxId=team.reduce((mx,t)=>Math.max(mx,t.id),0);
-    sp(pr=>({...pr,team:[...(pr.team||[]),{id:maxId+1,role:"New Role",name:"TBD",sal:25000,m:1,type:"Planned"}]}));
-  };
-
-  const founders=team.filter(t=>t.type==="Founder");
-  const employees=team.filter(t=>t.type!=="Founder");
+  const updateMember=(id,key,val)=>{sp(pr=>({...pr,team:(pr.team||[]).map(t=>t.id===id?{...t,[key]:val}:t)}));};
+  const removeMember=(id)=>{sp(pr=>({...pr,team:(pr.team||[]).filter(t=>t.id!==id)}));};
+  const addMember=()=>{const maxId=team.reduce((mx,t)=>Math.max(mx,t.id),0);sp(pr=>({...pr,team:[...(pr.team||[]),{id:maxId+1,role:"New Role",name:"TBD",sal:25000,m:1,type:"Planned"}]}));};
+  const founders=team.filter(t=>t.type==="Founder"); const employees=team.filter(t=>t.type!=="Founder");
   const totalPayroll=team.reduce((s,t)=>s+t.sal,0);
-
   return (
     <div className="tc">
       <div className="st">Headcount Planning</div>
@@ -756,44 +872,29 @@ function HeadcountTab({model:m,params:p,setParams:sp}) {
         <Metric label="Outsource/Mo" value={fmt(c(p.outsourceDevMonthly+p.outsourceAccountingMonthly),cur)}/>
         <Metric label="Total People Cost/Mo" value={fmt(c(totalPayroll+p.outsourceDevMonthly+p.outsourceAccountingMonthly),cur)} color="var(--yl)"/>
       </div>
-
       <Card title="Team Roster">
-        <div className="tw">
-          <table>
-            <thead><tr><th>Role</th><th>Name</th><th>Type</th><th>Salary/Mo</th><th>Start Month</th><th>Y1 Cost</th><th></th></tr></thead>
-            <tbody>
-              {team.map(t=>(
-                <tr key={t.id}>
-                  <td><input className="pi" style={{width:120,textAlign:"left",fontSize:12}} value={t.role} onChange={e=>updateMember(t.id,"role",e.target.value)}/></td>
-                  <td><input className="pi" style={{width:90,textAlign:"left",fontSize:12}} value={t.name} onChange={e=>updateMember(t.id,"name",e.target.value)}/></td>
-                  <td>
-                    <select className="pi" style={{width:90,textAlign:"left",fontSize:12}} value={t.type} onChange={e=>updateMember(t.id,"type",e.target.value)}>
-                      <option value="Founder">Founder</option>
-                      <option value="Employee">Employee</option>
-                      <option value="Planned">Planned</option>
-                    </select>
-                  </td>
-                  <td><input type="number" className="pi" style={{width:80,fontSize:12}} value={t.sal} onChange={e=>updateMember(t.id,"sal",parseFloat(e.target.value)||0)} step={5000}/></td>
-                  <td><input type="number" className="pi" style={{width:50,fontSize:12}} value={t.m} onChange={e=>updateMember(t.id,"m",parseInt(e.target.value)||1)} min={1} max={36}/></td>
-                  <td className="n">{t.sal>0?fmt(c(t.sal*Math.max(0,13-t.m)),cur):"—"}</td>
-                  <td><button className="del-btn" onClick={()=>removeMember(t.id)}>✕</button></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <div className="tw"><table>
+          <thead><tr><th>Role</th><th>Name</th><th>Type</th><th>Salary/Mo</th><th>Start</th><th>Y1 Cost</th><th></th></tr></thead>
+          <tbody>{team.map(t=>(
+            <tr key={t.id}>
+              <td><input className="pi" style={{width:120,textAlign:"left",fontSize:12}} value={t.role} onChange={e=>updateMember(t.id,"role",e.target.value)}/></td>
+              <td><input className="pi" style={{width:90,textAlign:"left",fontSize:12}} value={t.name} onChange={e=>updateMember(t.id,"name",e.target.value)}/></td>
+              <td><select className="pi" style={{width:90,textAlign:"left",fontSize:12}} value={t.type} onChange={e=>updateMember(t.id,"type",e.target.value)}><option value="Founder">Founder</option><option value="Employee">Employee</option><option value="Planned">Planned</option></select></td>
+              <td><input type="number" className="pi" style={{width:80,fontSize:12}} value={t.sal} onChange={e=>updateMember(t.id,"sal",parseFloat(e.target.value)||0)} step={5000}/></td>
+              <td><input type="number" className="pi" style={{width:50,fontSize:12}} value={t.m} onChange={e=>updateMember(t.id,"m",parseInt(e.target.value)||1)} min={1} max={36}/></td>
+              <td className="n">{t.sal>0?fmt(c(t.sal*Math.max(0,13-t.m)),cur):"—"}</td>
+              <td><button className="del-btn" onClick={()=>removeMember(t.id)}>✕</button></td>
+            </tr>
+          ))}</tbody>
+        </table></div>
         <button className="ct" style={{marginTop:10,display:"inline-block"}} onClick={addMember}>+ Add Team Member</button>
       </Card>
-
       <Card title="Outsourced & Office">
         <PI label="Dev Outsource (THB/mo)" value={p.outsourceDevMonthly} onChange={v=>u("outsourceDevMonthly",v)} step={5000}/>
         <PI label="Accounting (THB/mo)" value={p.outsourceAccountingMonthly} onChange={v=>u("outsourceAccountingMonthly",v)} step={1000}/>
         <PI label="Office Rent (THB/mo)" value={p.officeRent} onChange={v=>u("officeRent",v)} step={1000}/>
         <PI label="Utilities (THB/mo)" value={p.utilities} onChange={v=>u("utilities",v)} step={1000}/>
         <PI label="Misc Ops (THB/mo)" value={p.miscOps} onChange={v=>u("miscOps",v)} step={1000}/>
-        <div style={{borderTop:"1px solid var(--bd)",paddingTop:8,marginTop:8}}>
-          <div className="pr"><label className="pl" style={{fontWeight:600}}>Total Outsource + Office</label><span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:600}}>{fmt(c(p.outsourceDevMonthly+p.outsourceAccountingMonthly+p.officeRent+p.utilities+p.miscOps),cur)}/mo</span></div>
-        </div>
       </Card>
     </div>
   );
@@ -802,108 +903,60 @@ function HeadcountTab({model:m,params:p,setParams:sp}) {
 function IncomeTab({model:m,params:p}) {
   const c=v=>cv(v,p.exchangeRate,p.displayCurrency); const cur=p.displayCurrency;
   const [a1,a2,a3]=m.annuals;
-  return (
-    <div className="tc">
-      <div className="st">Income Statement (P&L)</div>
-      <Card title="Annual P&L">
-        <Tbl headers={["","Year 1","Year 2","Year 3"]} rows={[
-          ["Revenue",fmt(c(a1.revenue),cur),fmt(c(a2.revenue),cur),fmt(c(a3.revenue),cur)],
-          ["COGS",`(${fmt(c(a1.cogs),cur)})`,`(${fmt(c(a2.cogs),cur)})`,`(${fmt(c(a3.cogs),cur)})`],
-          ["Gross Profit",fmt(c(a1.grossProfit),cur),fmt(c(a2.grossProfit),cur),fmt(c(a3.grossProfit),cur)],
-          ["Gross Margin",a1.revenue>0?fmtP(a1.grossProfit/a1.revenue):"—",a2.revenue>0?fmtP(a2.grossProfit/a2.revenue):"—",a3.revenue>0?fmtP(a3.grossProfit/a3.revenue):"—"],
-          ["","","",""],
-          ["OpEx",`(${fmt(c(a1.opex),cur)})`,`(${fmt(c(a2.opex),cur)})`,`(${fmt(c(a3.opex),cur)})`],
-          ["","","",""],
-          ["EBITDA",fmt(c(a1.ebitda),cur),fmt(c(a2.ebitda),cur),fmt(c(a3.ebitda),cur)],
-          ["EBITDA Margin",a1.revenue>0?fmtP(a1.ebitda/a1.revenue):"—",a2.revenue>0?fmtP(a2.ebitda/a2.revenue):"—",a3.revenue>0?fmtP(a3.ebitda/a3.revenue):"—"],
-          ["Net Income",fmt(c(a1.netIncome),cur),fmt(c(a2.netIncome),cur),fmt(c(a3.netIncome),cur)],
-        ]} hl/>
-      </Card>
-      <Card title="Monthly P&L — Year 1">
-        <Tbl headers={["Mo","Rev","COGS","GP","OpEx","EBITDA"]} rows={m.data.filter(d=>d.year===1).map(d=>[
-          d.label,fmt(c(d.totalRevenue),cur),fmt(c(d.cogs),cur),fmt(c(d.grossProfit),cur),fmt(c(d.opex),cur),fmt(c(d.ebitda),cur),
-        ])}/>
-      </Card>
-    </div>
-  );
+  return (<div className="tc"><div className="st">Income Statement (P&L)</div>
+    <Card title="Annual P&L"><Tbl headers={["","Year 1","Year 2","Year 3"]} rows={[
+      ["Revenue",fmt(c(a1.revenue),cur),fmt(c(a2.revenue),cur),fmt(c(a3.revenue),cur)],
+      ["COGS",`(${fmt(c(a1.cogs),cur)})`,`(${fmt(c(a2.cogs),cur)})`,`(${fmt(c(a3.cogs),cur)})`],
+      ["Gross Profit",fmt(c(a1.grossProfit),cur),fmt(c(a2.grossProfit),cur),fmt(c(a3.grossProfit),cur)],
+      ["Gross Margin",a1.revenue>0?fmtP(a1.grossProfit/a1.revenue):"—",a2.revenue>0?fmtP(a2.grossProfit/a2.revenue):"—",a3.revenue>0?fmtP(a3.grossProfit/a3.revenue):"—"],
+      ["","","",""],["OpEx",`(${fmt(c(a1.opex),cur)})`,`(${fmt(c(a2.opex),cur)})`,`(${fmt(c(a3.opex),cur)})`],["","","",""],
+      ["EBITDA",fmt(c(a1.ebitda),cur),fmt(c(a2.ebitda),cur),fmt(c(a3.ebitda),cur)],
+      ["Net Income",fmt(c(a1.netIncome),cur),fmt(c(a2.netIncome),cur),fmt(c(a3.netIncome),cur)],
+    ]} hl/></Card>
+    <Card title="Monthly P&L — Year 1"><Tbl headers={["Mo","Rev","COGS","GP","OpEx","EBITDA"]} rows={m.data.filter(d=>d.year===1).map(d=>[d.label,fmt(c(d.totalRevenue),cur),fmt(c(d.cogs),cur),fmt(c(d.grossProfit),cur),fmt(c(d.opex),cur),fmt(c(d.ebitda),cur)])}/></Card>
+  </div>);
 }
 
 function BalanceTab({model:m,params:p}) {
   const c=v=>cv(v,p.exchangeRate,p.displayCurrency); const cur=p.displayCurrency;
   const eoy=[m.data[11],m.data[23],m.data[35]];
-  return (
-    <div className="tc">
-      <div className="st">Balance Sheet</div>
-      <Card title="End of Year">
-        <Tbl headers={["","Year 1","Year 2","Year 3"]} rows={[
-          ["ASSETS","","",""],
-          ["  Cash",...eoy.map(d=>fmt(c(d.cash),cur))],
-          ["  Fixed Assets",...eoy.map(d=>fmt(c(d.fixedAssets),cur))],
-          ["Total Assets",...eoy.map(d=>fmt(c(d.totalAssets),cur))],
-          ["","","",""],
-          ["LIABILITIES","","",""],
-          ["  Total","0","0","0"],
-          ["","","",""],
-          ["EQUITY","","",""],
-          ["  Paid-in Capital",...eoy.map(()=>fmt(c(p.raiseAmount),cur))],
-          ["  Retained Earnings",...eoy.map(d=>fmt(c(d.retainedEarnings),cur))],
-          ["Total Equity",...eoy.map(d=>fmt(c(d.equity),cur))],
-        ]} hl/>
-      </Card>
-    </div>
-  );
+  return (<div className="tc"><div className="st">Balance Sheet</div>
+    <Card title="End of Year"><Tbl headers={["","Year 1","Year 2","Year 3"]} rows={[
+      ["ASSETS","","",""],["  Cash",...eoy.map(d=>fmt(c(d.cash),cur))],["  Fixed Assets",...eoy.map(d=>fmt(c(d.fixedAssets),cur))],["Total Assets",...eoy.map(d=>fmt(c(d.totalAssets),cur))],
+      ["","","",""],["LIABILITIES","","",""],["  Total","0","0","0"],["","","",""],
+      ["EQUITY","","",""],["  Paid-in Capital",...eoy.map(()=>fmt(c(p.raiseAmount),cur))],["  Retained Earnings",...eoy.map(d=>fmt(c(d.retainedEarnings),cur))],["Total Equity",...eoy.map(d=>fmt(c(d.equity),cur))],
+    ]} hl/></Card>
+  </div>);
 }
 
 function CashFlowTab({model:m,params:p}) {
   const c=v=>cv(v,p.exchangeRate,p.displayCurrency); const cur=p.displayCurrency;
   const b=m.budget;
-  return (
-    <div className="tc">
-      <div className="st">Cash Flow Statement</div>
-      <Card title="Annual Cash Flow">
-        <Tbl headers={["","Year 1","Year 2","Year 3"]} rows={[
-          ["Beginning Cash",fmt(c(p.raiseAmount),cur),fmt(c(m.data[11].cash),cur),fmt(c(m.data[23].cash),cur)],
-          ["Cash from Revenue",...m.annuals.map(a=>fmt(c(a.revenue),cur))],
-          ["Cash to Operations",...m.annuals.map(a=>`(${fmt(c(a.totalCost),cur)})`)],
-          ["Net Operating CF",...m.annuals.map(a=>fmt(c(a.revenue-a.totalCost),cur))],
-          ["CapEx",`(${fmt(c(b.hardware),cur)})`,"0","0"],
-          ["Ending Cash",fmt(c(m.data[11].cash),cur),fmt(c(m.data[23].cash),cur),fmt(c(m.data[35].cash),cur)],
-        ]} hl/>
-      </Card>
-      <Card title="Monthly Cash Balance">
-        <Bar data={m.data.map(d=>c(d.cash))} h={100}/>
-        <div className="cl"><span>M1</span><span>M12</span><span>M24</span><span>M36</span></div>
-        <div style={{marginTop:8,fontSize:13,color:m.data[35].cash>0?"var(--gn)":"var(--rd)",fontWeight:500}}>
-          {m.data[35].cash>0?"Cash positive at M36":"Additional funding needed"}
-        </div>
-      </Card>
-      <Card title="Monthly — Year 1">
-        <Tbl headers={["Mo","In","Out","Net","Balance"]} rows={m.data.filter(d=>d.year===1).map(d=>[
-          d.label,fmt(c(d.totalRevenue),cur),fmt(c(d.totalCost),cur),fmt(c(d.netCF),cur),fmt(c(d.cash),cur),
-        ])}/>
-      </Card>
-    </div>
-  );
+  return (<div className="tc"><div className="st">Cash Flow Statement</div>
+    <Card title="Annual Cash Flow"><Tbl headers={["","Year 1","Year 2","Year 3"]} rows={[
+      ["Beginning Cash",fmt(c(p.raiseAmount),cur),fmt(c(m.data[11].cash),cur),fmt(c(m.data[23].cash),cur)],
+      ["Cash from Revenue",...m.annuals.map(a=>fmt(c(a.revenue),cur))],
+      ["Cash to Operations",...m.annuals.map(a=>`(${fmt(c(a.totalCost),cur)})`)],
+      ["Net Operating CF",...m.annuals.map(a=>fmt(c(a.revenue-a.totalCost),cur))],
+      ["CapEx",`(${fmt(c(b.hardware),cur)})`,"0","0"],
+      ["Ending Cash",fmt(c(m.data[11].cash),cur),fmt(c(m.data[23].cash),cur),fmt(c(m.data[35].cash),cur)],
+    ]} hl/></Card>
+    <Card title="Monthly Cash Balance">
+      <Bar data={m.data.map(d=>c(d.cash))} h={100}/><div className="cl"><span>M1</span><span>M12</span><span>M24</span><span>M36</span></div>
+      <div style={{marginTop:8,fontSize:13,color:m.data[35].cash>0?"var(--gn)":"var(--rd)",fontWeight:500}}>{m.data[35].cash>0?"Cash positive at M36":"Additional funding needed"}</div>
+    </Card>
+    <Card title="Monthly — Year 1"><Tbl headers={["Mo","In","Out","Net","Balance"]} rows={m.data.filter(d=>d.year===1).map(d=>[d.label,fmt(c(d.totalRevenue),cur),fmt(c(d.totalCost),cur),fmt(c(d.netCF),cur),fmt(c(d.cash),cur)])}/></Card>
+  </div>);
 }
 
-// Feature 5: Cap Table with IPO forecast — Fix 4: layout fix for Post-Seed
 function CapTableTab({model:m,params:p,setParams:sp}) {
   const c=v=>cv(v,p.exchangeRate,p.displayCurrency); const cur=p.displayCurrency;
   const u=(k,v)=>sp(pr=>({...pr,[k]:v}));
   const ct=m.capTable;
-
-  const updateRound=(idx,key,val)=>{
-    sp(pr=>{
-      const rounds=[...(pr.fundingRounds||[])];
-      rounds[idx]={...rounds[idx],[key]:parseFloat(val)||0};
-      return {...pr,fundingRounds:rounds};
-    });
-  };
-
+  const updateRound=(idx,key,val)=>{sp(pr=>{const rounds=[...(pr.fundingRounds||[])];rounds[idx]={...rounds[idx],[key]:parseFloat(val)||0};return{...pr,fundingRounds:rounds};});};
   return (
     <div className="tc">
       <div className="st">Cap Table & Path to IPO</div>
-
       <Card title="Seed Round Configuration">
         <div className="g2">
           <div>
@@ -912,15 +965,11 @@ function CapTableTab({model:m,params:p,setParams:sp}) {
             <PI label="Equity Offered (%)" value={p.equityOffered} onChange={v=>u("equityOffered",v)} step={1} max={50}/>
           </div>
           <div className="mg" style={{gridTemplateColumns:"1fr 1fr"}}>
-            <Metric label="Pre-Money" value={fmt(c(p.preMoneyValuation),cur)}/>
-            <Metric label="Raise" value={fmt(c(p.raiseAmount),cur)} sub={`${p.equityOffered}% equity`}/>
-            <Metric label="Post-Money" value={fmt(c(p.preMoneyValuation+p.raiseAmount),cur)}/>
-            <Metric label="Price/Share" value={fmtF(c(p.preMoneyValuation/1000000),cur)}/>
+            <Metric label="Pre-Money" value={fmt(c(p.preMoneyValuation),cur)}/><Metric label="Raise" value={fmt(c(p.raiseAmount),cur)} sub={`${p.equityOffered}% equity`}/>
+            <Metric label="Post-Money" value={fmt(c(p.preMoneyValuation+p.raiseAmount),cur)}/><Metric label="Price/Share" value={fmtF(c(p.preMoneyValuation/1000000),cur)}/>
           </div>
         </div>
       </Card>
-
-      {/* Fix 4: Post-Seed uses full-width stacked layout instead of cramped g2 grid */}
       <Card title="Post-Seed Ownership">
         <Tbl headers={["Shareholder","Shares","Post-%","Value"]} rows={[
           ...ct.post.map(s=>[s.name,fmtN(s.shares),`${s.postPct}%`,fmt(c(parseFloat(s.postPct)/100*(p.preMoneyValuation+p.raiseAmount)),cur)]),
@@ -930,40 +979,30 @@ function CapTableTab({model:m,params:p,setParams:sp}) {
           <Pie data={ct.post.map((s,i)=>({label:s.name.split("—")[0].trim(),value:parseFloat(s.postPct),color:["#3b82f6","#10b981","#f59e0b","#6366f1","#8b5cf6","#ec4899"][i]}))} size={180}/>
         </div>
       </Card>
-
       <Card title="Future Funding Rounds">
-        <div className="tw">
-          <table>
-            <thead><tr><th>Round</th><th>Pre-Money Val</th><th>Raise</th><th>Equity %</th></tr></thead>
-            <tbody>
-              {(p.fundingRounds||[]).map((r,i)=>(
-                <tr key={i}>
-                  <td><input className="pi" style={{width:100,textAlign:"left",fontSize:12}} value={r.name} onChange={e=>{sp(pr=>{const rounds=[...(pr.fundingRounds||[])];rounds[i]={...rounds[i],name:e.target.value};return{...pr,fundingRounds:rounds};});}}/></td>
-                  <td><input type="number" className="pi" style={{width:120,fontSize:12}} value={r.valuation} onChange={e=>updateRound(i,"valuation",e.target.value)} step={10000000}/></td>
-                  <td><input type="number" className="pi" style={{width:100,fontSize:12}} value={r.raise} onChange={e=>updateRound(i,"raise",e.target.value)} step={10000000}/></td>
-                  <td><input type="number" className="pi" style={{width:60,fontSize:12}} value={r.equity} onChange={e=>updateRound(i,"equity",e.target.value)} step={1} max={50}/></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <div className="tw"><table>
+          <thead><tr><th>Round</th><th>Pre-Money Val</th><th>Raise</th><th>Equity %</th></tr></thead>
+          <tbody>{(p.fundingRounds||[]).map((r,i)=>(
+            <tr key={i}>
+              <td><input className="pi" style={{width:100,textAlign:"left",fontSize:12}} value={r.name} onChange={e=>{sp(pr=>{const rounds=[...(pr.fundingRounds||[])];rounds[i]={...rounds[i],name:e.target.value};return{...pr,fundingRounds:rounds};});}}/></td>
+              <td><input type="number" className="pi" style={{width:120,fontSize:12}} value={r.valuation} onChange={e=>updateRound(i,"valuation",e.target.value)} step={10000000}/></td>
+              <td><input type="number" className="pi" style={{width:100,fontSize:12}} value={r.raise} onChange={e=>updateRound(i,"raise",e.target.value)} step={10000000}/></td>
+              <td><input type="number" className="pi" style={{width:60,fontSize:12}} value={r.equity} onChange={e=>updateRound(i,"equity",e.target.value)} step={1} max={50}/></td>
+            </tr>
+          ))}</tbody>
+        </table></div>
         <PI label="IPO Valuation (THB)" value={p.ipoValuation} onChange={v=>u("ipoValuation",v)} step={100000000}/>
       </Card>
-
       <Card title="Path to IPO — Valuation & Dilution">
         <Tbl headers={["Round","Pre-Money","Raise","Post-Money","New Shares","Total Shares","Founder %","Founder Value"]} rows={ct.rounds.map(r=>{
           const fPct=(ct.founders.reduce((s,f)=>s+f.shares,0)/r.postShares*100);
-          const fVal=fPct/100*r.postMoney;
-          return [r.name,fmt(c(r.valuation),cur),fmt(c(r.raise),cur),fmt(c(r.postMoney),cur),fmtN(r.newShares),fmtN(r.postShares),fPct.toFixed(1)+"%",fmt(c(fVal),cur)];
+          return [r.name,fmt(c(r.valuation),cur),fmt(c(r.raise),cur),fmt(c(r.postMoney),cur),fmtN(r.newShares),fmtN(r.postShares),fPct.toFixed(1)+"%",fmt(c(fPct/100*r.postMoney),cur)];
         })} hl/>
       </Card>
-
       <Card title="Exit Value at IPO">
         <div className="mg">
-          <Metric label="IPO Valuation" value={fmt(c(ct.ipoVal),cur)} color="var(--gn)"/>
-          <Metric label="Founders Total %" value={ct.founderPctAtIPO.toFixed(1)+"%"}/>
-          <Metric label="Founders Exit Value" value={fmt(c(ct.founderValueAtIPO),cur)} color="var(--gn)"/>
-          <Metric label="Total Dilution" value={((100-ct.founderPctAtIPO)).toFixed(1)+"%"} sub="From all rounds" color="var(--yl)"/>
+          <Metric label="IPO Valuation" value={fmt(c(ct.ipoVal),cur)} color="var(--gn)"/><Metric label="Founders Total %" value={ct.founderPctAtIPO.toFixed(1)+"%"}/>
+          <Metric label="Founders Exit Value" value={fmt(c(ct.founderValueAtIPO),cur)} color="var(--gn)"/><Metric label="Total Dilution" value={((100-ct.founderPctAtIPO)).toFixed(1)+"%"} sub="From all rounds" color="var(--yl)"/>
         </div>
         <Tbl headers={["Founder","Original %","At IPO %","Exit Value"]} rows={ct.founders.map(f=>{
           const pctAtIPO=f.shares/ct.cumulativeShares*100;
@@ -978,151 +1017,76 @@ function SensitivityTab({model:m,params:p}) {
   const c=v=>cv(v,p.exchangeRate,p.displayCurrency); const cur=p.displayCurrency;
   const varLbl={trialToCustomerRate:"Trial to Customer Conv.",basicChurnMonthly:"Basic Churn",websiteVisitors:"Website Visitors",visitorToLeadRate:"Visitor to Lead Conv."};
   const beM = m.data.findIndex(d=>d.ebitda>0);
-  return (
-    <div className="tc">
-      <div className="st">Sensitivity Analysis</div>
-      <Card title={`Variable: ${varLbl[p.sensitivityVar]||p.sensitivityVar}`}>
-        <Tbl headers={["Scenario","x","Y1 Rev","Y2 Rev","Y3 Rev","Y3 Cust"]} rows={m.sens.map(s=>[
-          s.label,`${s.mult}x`,fmt(c(s.y1),cur),fmt(c(s.y2),cur),fmt(c(s.y3),cur),fmtN(s.y3Cust),
-        ])}/>
+  return (<div className="tc"><div className="st">Sensitivity Analysis</div>
+    <Card title={`Variable: ${varLbl[p.sensitivityVar]||p.sensitivityVar}`}><Tbl headers={["Scenario","x","Y1 Rev","Y2 Rev","Y3 Rev","Y3 Cust"]} rows={m.sens.map(s=>[s.label,`${s.mult}x`,fmt(c(s.y1),cur),fmt(c(s.y2),cur),fmt(c(s.y3),cur),fmtN(s.y3Cust)])}/></Card>
+    <div className="g2">
+      <Card title="Y3 Revenue Comparison">
+        <div style={{display:"flex",gap:14,alignItems:"flex-end",height:140}}>
+          {m.sens.map((s,i)=>{const mx=Math.max(...m.sens.map(x=>x.y3));const cols=["var(--rd)","var(--ac)","var(--gn)"];return(
+            <div key={i} style={{flex:1,textAlign:"center"}}><div style={{height:`${(s.y3/mx)*100}px`,background:cols[i],borderRadius:"4px 4px 0 0",display:"flex",alignItems:"flex-start",justifyContent:"center",paddingTop:4,fontSize:11,color:"#fff",fontWeight:600}}>{fmt(c(s.y3),cur)}</div><div style={{fontSize:12,marginTop:4,color:"var(--td)"}}>{s.label}</div></div>
+          );})}
+        </div>
       </Card>
-      <div className="g2">
-        <Card title="Y3 Revenue Comparison">
-          <div style={{display:"flex",gap:14,alignItems:"flex-end",height:140}}>
-            {m.sens.map((s,i)=>{
-              const mx=Math.max(...m.sens.map(x=>x.y3));
-              const cols=["var(--rd)","var(--ac)","var(--gn)"];
-              return(
-                <div key={i} style={{flex:1,textAlign:"center"}}>
-                  <div style={{height:`${(s.y3/mx)*100}px`,background:cols[i],borderRadius:"4px 4px 0 0",display:"flex",alignItems:"flex-start",justifyContent:"center",paddingTop:4,fontSize:11,color:"#fff",fontWeight:600}}>{fmt(c(s.y3),cur)}</div>
-                  <div style={{fontSize:12,marginTop:4,color:"var(--td)"}}>{s.label}</div>
-                </div>
-              );
-            })}
-          </div>
-        </Card>
-        <Card title="Break-Even">
-          <div className="mg">
-            <Metric label="Break-Even Month" value={beM>=0?`Month ${beM+1}`:"Beyond M36"} sub={beM>=0?m.data[beM].label:"Need more funding"} color={beM>=0?"var(--gn)":"var(--yl)"}/>
-            <Metric label="Runway" value={`${Math.round(p.raiseAmount/(m.annuals[0].totalCost/12))} mo`} sub="At Y1 burn rate"/>
-          </div>
-        </Card>
-      </div>
+      <Card title="Break-Even"><div className="mg">
+        <Metric label="Break-Even Month" value={beM>=0?`Month ${beM+1}`:"Beyond M36"} sub={beM>=0?m.data[beM].label:"Need more funding"} color={beM>=0?"var(--gn)":"var(--yl)"}/>
+        <Metric label="Runway" value={`${Math.round(p.raiseAmount/(m.annuals[0].totalCost/12))} mo`} sub="At Y1 burn rate"/>
+      </div></Card>
     </div>
-  );
+  </div>);
 }
 
 function ParamsTab({params:p,setParams:sp}) {
   const u=(k,v)=>sp(pr=>({...pr,[k]:v}));
   const secs=[
-    {t:"Currency & Valuation",f:[
-      {k:"exchangeRate",l:"THB/USD Rate",s:0.5},
-    ]},
-    {t:"LLM Strategy",f:[
-      {k:"llmStrategy",l:"Strategy",type:"select",opts:["api","own","hybrid"]},{k:"apiCostPerUser",l:"API Cost/User/Mo (THB)",s:10},
-    ]},
-    {t:"Pricing (USD/mo)",f:[
-      {k:"basicMonthly",l:"Basic Monthly",s:1},{k:"basicAnnual",l:"Basic Ann/Mo",s:1},
-      {k:"proMonthly",l:"Pro Monthly",s:1},{k:"proAnnual",l:"Pro Ann/Mo",s:1},
-      {k:"enterpriseMonthly",l:"Enterprise Monthly",s:1},{k:"enterpriseAnnual",l:"Enterprise Ann/Mo",s:1},
-      {k:"storageTopupMonthly",l:"Storage USD/50GB",s:1},
-    ]},
-    {t:"Acquisition",f:[
-      {k:"revenueStartMonth",l:"Revenue Start Month",s:1,mn:1,mx:12},
-      {k:"tierSplitBasic",l:"Basic Split %",s:0.05,mx:1},{k:"tierSplitPro",l:"Pro Split %",s:0.05,mx:1},{k:"tierSplitEnterprise",l:"Ent Split %",s:0.05,mx:1},
-      {k:"y1AnnualRatio",l:"Annual Ratio",s:0.05,mx:1},{k:"y2GrowthRate",l:"Y2 Growth x",s:0.1},{k:"y3GrowthRate",l:"Y3 Growth x",s:0.1},
-    ]},
-    {t:"Churn",f:[
-      {k:"basicChurnMonthly",l:"Basic/Mo",s:0.01,mx:1},{k:"proChurnMonthly",l:"Pro/Mo",s:0.01,mx:1},{k:"enterpriseChurnMonthly",l:"Ent/Mo",s:0.01,mx:1},
-    ]},
-    {t:"Sensitivity",f:[
-      {k:"sensitivityVar",l:"Variable",type:"select",opts:["trialToCustomerRate","basicChurnMonthly","websiteVisitors","visitorToLeadRate"]},
-      {k:"bestMultiplier",l:"Best x",s:0.1},{k:"worstMultiplier",l:"Worst x",s:0.1},
-    ]},
+    {t:"Currency & Valuation",f:[{k:"exchangeRate",l:"THB/USD Rate",s:0.5}]},
+    {t:"LLM Strategy",f:[{k:"llmStrategy",l:"Strategy",type:"select",opts:["api","own","hybrid"]},{k:"apiCostPerUser",l:"API Cost/User/Mo (THB)",s:10}]},
+    {t:"Pricing (USD/mo)",f:[{k:"basicMonthly",l:"Basic Monthly",s:1},{k:"basicAnnual",l:"Basic Ann/Mo",s:1},{k:"proMonthly",l:"Pro Monthly",s:1},{k:"proAnnual",l:"Pro Ann/Mo",s:1},{k:"enterpriseMonthly",l:"Enterprise Monthly",s:1},{k:"enterpriseAnnual",l:"Enterprise Ann/Mo",s:1},{k:"storageTopupMonthly",l:"Storage USD/50GB",s:1}]},
+    {t:"Acquisition",f:[{k:"revenueStartMonth",l:"Revenue Start Month",s:1,mn:1,mx:12},{k:"tierSplitBasic",l:"Basic Split %",s:0.05,mx:1},{k:"tierSplitPro",l:"Pro Split %",s:0.05,mx:1},{k:"tierSplitEnterprise",l:"Ent Split %",s:0.05,mx:1},{k:"y1AnnualRatio",l:"Annual Ratio",s:0.05,mx:1},{k:"y2GrowthRate",l:"Y2 Growth x",s:0.1},{k:"y3GrowthRate",l:"Y3 Growth x",s:0.1}]},
+    {t:"Churn",f:[{k:"basicChurnMonthly",l:"Basic/Mo",s:0.01,mx:1},{k:"proChurnMonthly",l:"Pro/Mo",s:0.01,mx:1},{k:"enterpriseChurnMonthly",l:"Ent/Mo",s:0.01,mx:1}]},
+    {t:"Sensitivity",f:[{k:"sensitivityVar",l:"Variable",type:"select",opts:["trialToCustomerRate","basicChurnMonthly","websiteVisitors","visitorToLeadRate"]},{k:"bestMultiplier",l:"Best x",s:0.1},{k:"worstMultiplier",l:"Worst x",s:0.1}]},
   ];
-  return (
-    <div className="tc">
-      <div className="st">Settings</div>
-      <div className="pg">
-        {secs.map((sec,si)=>(
-          <Card key={si} title={sec.t}>
-            {sec.f.map((f,fi)=>f.type==="select"?(
-              <SI key={fi} label={f.l} value={p[f.k]} onChange={v=>u(f.k,v)} opts={f.opts}/>
-            ):(
-              <PI key={fi} label={f.l} value={p[f.k]} onChange={v=>u(f.k,v)} step={f.s} min={f.mn} max={f.mx}/>
-            ))}
-          </Card>
-        ))}
-      </div>
-    </div>
-  );
+  return (<div className="tc"><div className="st">Settings</div><div className="pg">
+    {secs.map((sec,si)=>(<Card key={si} title={sec.t}>{sec.f.map((f,fi)=>f.type==="select"?(<SI key={fi} label={f.l} value={p[f.k]} onChange={v=>u(f.k,v)} opts={f.opts}/>):(<PI key={fi} label={f.l} value={p[f.k]} onChange={v=>u(f.k,v)} step={f.s} min={f.mn} max={f.mx}/>))}</Card>))}
+  </div></div>);
 }
 
 // ============================================================
-// MAIN APP with Theme Support + localStorage persistence
+// MAIN APP
 // ============================================================
 export default function App() {
-  // Fix 2: Load from localStorage on mount
   const [p, sp] = useState(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
-        // Merge with defaults to handle new fields added in updates
         return { ...DEFAULT_PARAMS, ...parsed, llmBudget: { ...DEFAULT_LLM_BUDGET, ...(parsed.llmBudget || {}) } };
       }
-    } catch (e) { /* ignore corrupted data */ }
+    } catch (e) {}
     return DEFAULT_PARAMS;
   });
 
-  const [tab, setTab] = useState("overview");
-  const [theme, setTheme] = useState(() => {
-    try { return localStorage.getItem("law5_theme") || "dark"; } catch { return "dark"; }
-  });
+  const [tab, setTab] = useState("pitch");
+  const [theme, setTheme] = useState(() => { try { return localStorage.getItem("law5_theme") || "dark"; } catch { return "dark"; } });
   const [dirty, setDirty] = useState(false);
   const [savedMsg, setSavedMsg] = useState("");
 
-  // Track if params changed (dirty state)
-  const setParams = useCallback((updater) => {
-    sp(updater);
-    setDirty(true);
-  }, []);
+  const setParams = useCallback((updater) => { sp(updater); setDirty(true); }, []);
 
   const model = useMemo(() => computeModel(p), [p]);
   const toggle = () => setParams(pr => ({ ...pr, displayCurrency: pr.displayCurrency==="THB"?"USD":"THB" }));
-  const toggleTheme = () => {
-    setTheme(t => {
-      const next = t==="dark"?"light":"dark";
-      try { localStorage.setItem("law5_theme", next); } catch {}
-      return next;
-    });
-  };
+  const toggleTheme = () => { setTheme(t => { const next = t==="dark"?"light":"dark"; try { localStorage.setItem("law5_theme", next); } catch {} return next; }); };
 
-  // Fix 2: Save to localStorage
   const handleSave = () => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(p));
-      setDirty(false);
-      setSavedMsg("Saved!");
-      setTimeout(() => setSavedMsg(""), 2000);
-    } catch (e) {
-      setSavedMsg("Save failed!");
-      setTimeout(() => setSavedMsg(""), 3000);
-    }
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(p)); setDirty(false); setSavedMsg("Saved!"); setTimeout(() => setSavedMsg(""), 2000); }
+    catch (e) { setSavedMsg("Save failed!"); setTimeout(() => setSavedMsg(""), 3000); }
   };
-
-  // Fix 2: Reset to defaults
-  const handleReset = () => {
-    sp(DEFAULT_PARAMS);
-    setDirty(true);
-    setSavedMsg("Reset to defaults (unsaved)");
-    setTimeout(() => setSavedMsg(""), 2500);
-  };
+  const handleReset = () => { sp(DEFAULT_PARAMS); setDirty(true); setSavedMsg("Reset to defaults"); setTimeout(() => setSavedMsg(""), 2500); };
 
   const props = { model, params: p, setParams };
 
   const renderTab = () => {
     switch(tab) {
+      case "pitch": return <PitchTab {...props}/>;
       case "overview": return <OverviewTab {...props}/>;
       case "revenue": return <RevenueTab {...props}/>;
       case "cost": return <CostTab {...props}/>;
@@ -1134,7 +1098,7 @@ export default function App() {
       case "captable": return <CapTableTab {...props}/>;
       case "sensitivity": return <SensitivityTab {...props}/>;
       case "params": return <ParamsTab {...props}/>;
-      default: return <OverviewTab {...props}/>;
+      default: return <PitchTab {...props}/>;
     }
   };
 
@@ -1142,14 +1106,10 @@ export default function App() {
     <>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-
         [data-theme="dark"]{--bg:#0c0f1a;--bg2:#141829;--bg3:#1c2038;--bd:#2a2f4a;--tx:#e8eaf0;--td:#8890a8;--ac:#6c8cff;--gn:#34d399;--rd:#f87171;--yl:#fbbf24;--pp:#a78bfa}
         [data-theme="light"]{--bg:#f0f2f7;--bg2:#ffffff;--bg3:#e8eaf2;--bd:#c8cdd8;--tx:#1a1d2e;--td:#5f6780;--ac:#4f6df5;--gn:#059669;--rd:#dc2626;--yl:#d97706;--pp:#7c3aed}
-
         *{margin:0;padding:0;box-sizing:border-box}
         body,#root{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--tx);min-height:100vh}
-
-        /* Fix 1: ensure ALL text inherits theme color */
         .app{display:flex;min-height:100vh;color:var(--tx);background:var(--bg)}
         .sb{width:220px;background:var(--bg2);border-right:1px solid var(--bd);padding:16px 0;flex-shrink:0;position:sticky;top:0;height:100vh;overflow-y:auto}
         .sb-logo{padding:0 16px 16px;border-bottom:1px solid var(--bd);margin-bottom:8px}
@@ -1160,7 +1120,7 @@ export default function App() {
         .ni.ac{background:var(--bg3);color:var(--ac);border-left-color:var(--ac);font-weight:600}
         .ct{margin:8px 16px;padding:8px 12px;background:var(--bg3);border:1px solid var(--bd);border-radius:8px;color:var(--tx);font-size:12px;cursor:pointer;text-align:center;font-family:'DM Sans',sans-serif;transition:all .15s}
         .ct:hover{border-color:var(--ac);background:var(--ac);color:#fff}
-        .mn{flex:1;padding:24px 32px;overflow-y:auto;max-height:100vh}
+        .mn{flex:1;padding:24px 32px 80px;overflow-y:auto;max-height:100vh;position:relative}
         .tc{max-width:1200px}
         .st{font-size:20px;font-weight:700;margin-bottom:20px;letter-spacing:-.3px;color:var(--tx)}
         .mg{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:18px}
@@ -1172,8 +1132,6 @@ export default function App() {
         .cd-t{font-size:13px;font-weight:600;color:var(--td);margin-bottom:14px;text-transform:uppercase;letter-spacing:.5px}
         .g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
         .tw{overflow-x:auto}
-
-        /* Fix 1: table styles use CSS variables instead of hardcoded rgba */
         table{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--tx)}
         th{text-align:left;padding:8px 10px;border-bottom:2px solid var(--bd);color:var(--td);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
         td{padding:6px 10px;border-bottom:1px solid var(--bd);white-space:nowrap;color:var(--tx)}
@@ -1182,36 +1140,29 @@ export default function App() {
         tr.hlr td{background:color-mix(in srgb, var(--ac) 10%, transparent);font-weight:700;border-top:2px solid var(--ac)}
         .cl{display:flex;justify-content:space-between;font-size:10px;color:var(--td);margin-top:4px;font-family:'JetBrains Mono',monospace}
         .pg{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
-
-        /* Fix 1: .pr border uses CSS variable */
         .pr{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--bd)}
         .pl{font-size:12px;color:var(--td)}
-
-        /* Fix 1: input and select fully themed */
         .pi{width:110px;padding:5px 8px;background:var(--bg3);border:1px solid var(--bd);border-radius:6px;color:var(--tx);font-family:'JetBrains Mono',monospace;font-size:12px;text-align:right}
         .pi::placeholder{color:var(--td);opacity:0.6}
         .pi:focus{outline:none;border-color:var(--ac);box-shadow:0 0 0 2px color-mix(in srgb, var(--ac) 20%, transparent)}
         select.pi{text-align:left;cursor:pointer;color:var(--tx);-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238890a8'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center;padding-right:22px}
         select.pi option{background:var(--bg2);color:var(--tx)}
-
-        /* Fix 1: delete button */
         .del-btn{background:transparent;border:none;color:var(--rd);cursor:pointer;font-size:14px;padding:2px 6px;border-radius:4px;line-height:1}
         .del-btn:hover{background:var(--rd);color:#fff}
-
         .sb-info{padding:12px 16px;font-size:10px;color:var(--td);line-height:1.6;border-top:1px solid var(--bd);margin-top:8px}
 
-        /* Fix 2: Save bar styling */
-        .save-bar{display:flex;align-items:center;gap:8px;padding:8px 16px;border-top:1px solid var(--bd);margin-top:8px}
-        .save-btn{flex:1;padding:8px;border-radius:8px;font-size:12px;font-family:'DM Sans',sans-serif;cursor:pointer;font-weight:600;border:none;transition:all .15s}
-        .save-btn.primary{background:var(--gn);color:#fff}
-        .save-btn.primary:hover{filter:brightness(1.1)}
-        .save-btn.secondary{background:var(--bg3);color:var(--td);border:1px solid var(--bd)}
-        .save-btn.secondary:hover{border-color:var(--rd);color:var(--rd)}
+        /* Floating save bar at bottom of main content */
+        .float-save{position:fixed;bottom:0;right:0;left:220px;background:var(--bg2);border-top:1px solid var(--bd);padding:10px 32px;display:flex;align-items:center;gap:12px;z-index:100;box-shadow:0 -4px 20px rgba(0,0,0,.15);animation:slideUp .2s ease}
+        @keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
+        .float-save .save-btn{padding:8px 24px;border-radius:8px;font-size:13px;font-family:'DM Sans',sans-serif;cursor:pointer;font-weight:600;border:none;transition:all .15s}
+        .float-save .save-btn.primary{background:var(--gn);color:#fff}
+        .float-save .save-btn.primary:hover{filter:brightness(1.1)}
+        .float-save .save-btn.secondary{background:var(--bg3);color:var(--td);border:1px solid var(--bd)}
+        .float-save .save-btn.secondary:hover{border-color:var(--rd);color:var(--rd)}
         .dirty-dot{width:8px;height:8px;border-radius:50%;background:var(--yl);display:inline-block;animation:pulse 1.5s infinite}
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
-        .saved-msg{font-size:11px;color:var(--gn);font-weight:600;text-align:center;padding:4px 16px}
 
-        @media(max-width:768px){.app{flex-direction:column}.sb{width:100%;height:auto;position:relative;display:flex;flex-wrap:wrap;padding:8px;gap:2px}.sb-logo{padding:0 8px 8px;width:100%}.ni{padding:6px 10px;font-size:11px;border-left:none}.mn{padding:16px}.g2{grid-template-columns:1fr}.pg{grid-template-columns:1fr}}
+        @media(max-width:768px){.app{flex-direction:column}.sb{width:100%;height:auto;position:relative;display:flex;flex-wrap:wrap;padding:8px;gap:2px}.sb-logo{padding:0 8px 8px;width:100%}.ni{padding:6px 10px;font-size:11px;border-left:none}.mn{padding:16px 16px 80px}.g2{grid-template-columns:1fr}.pg{grid-template-columns:1fr}.float-save{left:0}}
       `}</style>
       <div className="app" data-theme={theme}>
         <nav className="sb">
@@ -1224,29 +1175,28 @@ export default function App() {
               <span style={{fontSize:15,width:20,textAlign:"center"}}>{t.icon}</span>{t.label}
             </div>
           ))}
-          <button className="ct" onClick={toggle}>
-            {p.displayCurrency==="THB"?"THB to USD":"USD to THB"}
-          </button>
-          <button className="ct" onClick={toggleTheme}>
-            {theme==="dark"?"☀️ Light Mode":"🌙 Dark Mode"}
-          </button>
-
-          {/* Fix 2: Save/Reset bar */}
-          <div className="save-bar">
-            <button className="save-btn primary" onClick={handleSave}>
-              💾 Save {dirty && <span className="dirty-dot" style={{marginLeft:4}}/>}
-            </button>
-            <button className="save-btn secondary" onClick={handleReset}>↺</button>
-          </div>
-          {savedMsg && <div className="saved-msg">{savedMsg}</div>}
-          {dirty && <div style={{fontSize:10,color:"var(--yl)",textAlign:"center",padding:"2px 16px"}}>Unsaved changes</div>}
-
+          <button className="ct" onClick={toggle}>{p.displayCurrency==="THB"?"THB to USD":"USD to THB"}</button>
+          <button className="ct" onClick={toggleTheme}>{theme==="dark"?"☀️ Light Mode":"🌙 Dark Mode"}</button>
           <div className="sb-info">
             All projections are estimates.<br/>
             Currency: {p.displayCurrency} ({p.exchangeRate} THB/USD)
           </div>
         </nav>
-        <main className="mn">{renderTab()}</main>
+        <main className="mn">
+          {renderTab()}
+        </main>
+
+        {/* Floating save bar — only shows when dirty */}
+        {dirty && (
+          <div className="float-save">
+            <span className="dirty-dot"/>
+            <span style={{fontSize:12,color:"var(--yl)",fontWeight:500}}>Unsaved changes</span>
+            <div style={{flex:1}}/>
+            {savedMsg && <span style={{fontSize:12,color:"var(--gn)",fontWeight:600}}>{savedMsg}</span>}
+            <button className="save-btn secondary" onClick={handleReset}>↺ Reset</button>
+            <button className="save-btn primary" onClick={handleSave}>💾 Save Changes</button>
+          </div>
+        )}
       </div>
     </>
   );
