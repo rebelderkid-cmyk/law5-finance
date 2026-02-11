@@ -25,16 +25,13 @@ const DEFAULT_ROUNDS = [
   { name: "Series C", valuation: 2500000000, raise: 300000000, equity: 10 },
 ];
 
-// LLM budget — apiReserve is now auto-calculated, not manually set
-const DEFAULT_LLM_BUDGET = {
-  dev: 2000000, hardware: 2500000,
-  salaryOps: 2000000, software: 1000000, marketing: 1500000, buffer: 0,
-};
+// LLM budget — only dev & software are manual inputs; rest auto-derived in Use of Funds
+const DEFAULT_LLM_BUDGET = { dev: 2000000, software: 1000000 };
 
 const LLM_PRESETS = {
-  api:    { dev: 2000000, hardware: 0,       salaryOps: 2000000, software: 1000000, marketing: 2000000, buffer: 1500000 },
-  own:    { dev: 2000000, hardware: 5000000, salaryOps: 2000000, software: 1000000, marketing: 0,       buffer: 0 },
-  hybrid: { dev: 2000000, hardware: 2500000, salaryOps: 2000000, software: 1000000, marketing: 1500000, buffer: 0 },
+  api:    { dev: 2000000, software: 1000000 },
+  own:    { dev: 2000000, software: 1000000 },
+  hybrid: { dev: 2000000, software: 1000000 },
 };
 
 const DEFAULT_PARAMS = {
@@ -56,6 +53,8 @@ const DEFAULT_PARAMS = {
   enterpriseAvgSeats: 5, enterpriseExtraSeatAvg: 3,
   salesOutreachPct: 0.50, lineAffiliationPct: 0.30, wordOfMouthPct: 0.10, contentMarketingPct: 0.10,
   marketingBudgetY1: 1500000, lineAffiliateCommission: 0.10,
+  digitalAdsBudgetY1: 50000, eventsBudgetY1: 300000, contentBudgetY1: 100000, affiliateBudgetY1: 200000,
+  includeSalesInMktBudget: true,
   salesRepsY1: 2, salesRepCostMonthly: 30000, dealsPerRepPerMonth: 4,
   apiCostPerUser: 150, paymentProcessingRate: 0.029, supportCostPerUser: 50,
   outsourceDevMonthly: 80000, outsourceAccountingMonthly: 15000,
@@ -70,6 +69,7 @@ const DEFAULT_PARAMS = {
   opexEscalationRate: 0.15, scaleUpYear: 3, scaleUpMultiplier: 1.5,
   loanAmount: 0, loanInterestRate: 0.08, loanTermMonths: 36, loanStartMonth: 0,
   softwareCapex: 0,
+  hwUnitCost: 250000, hwUsersPerUnit: 30, hwDepreciationMonths: 36,
 };
 
 const STORAGE_KEY = "law5_params";
@@ -136,6 +136,20 @@ function computeModel(p, _skipSens = false) {
 
   const totalMonths = (p.projectionYears || 5) * 12;
   const rates = p.growthRates || {};
+
+  // Bottom-up marketing budget
+  const salesTeamAnnual = p.includeSalesInMktBudget ? (p.salesRepsY1 || 0) * (p.salesRepCostMonthly || 0) * 12 : 0;
+  const digitalAdsAnnual = (p.digitalAdsBudgetY1 || 0) * 12;
+  const eventsAnnual = p.eventsBudgetY1 || 0;
+  const contentAnnual = p.contentBudgetY1 || 0;
+  const affiliateAnnual = p.affiliateBudgetY1 || 0;
+  const mktBudgetY1 = salesTeamAnnual + digitalAdsAnnual + eventsAnnual + contentAnnual + affiliateAnnual;
+
+  // Hardware fleet tracking
+  let hwUnitsOwned = 0, hwTotalInvested = 0;
+  const hwPurchases = []; // [{month, units, cost}]
+  const hwDepMonths = p.hwDepreciationMonths || 36;
+
   let bM=0, bA=0, pM=0, pA=0, eM=0, eA=0;
   const data = [];
 
@@ -184,12 +198,37 @@ function computeModel(p, _skipSens = false) {
 
     const ovr = (p.costOverrides||{})[m] || {};
     const api = p.llmStrategy === "own" ? 0 : total * p.apiCostPerUser;
-    const hwDep = budget.hardware / totalMonths;
+
+    // Dynamic hardware fleet (only for own/hybrid)
+    let hwNewUnits = 0, hwCapExMonth = 0, hwDep = 0;
+    if (p.llmStrategy !== "api") {
+      let unitsNeeded = Math.ceil(Math.max(total, 1) / (p.hwUsersPerUnit || 30)); // at least 1 dev server
+      if (p.llmStrategy === "hybrid") unitsNeeded = Math.ceil(unitsNeeded / 2);
+      unitsNeeded = Math.max(unitsNeeded, m === 1 ? 1 : 0); // ensure 1 unit at M1
+      hwNewUnits = Math.max(0, unitsNeeded - hwUnitsOwned);
+      if (hwNewUnits > 0) {
+        hwCapExMonth = hwNewUnits * (p.hwUnitCost || 250000);
+        hwPurchases.push({month: m, units: hwNewUnits, cost: hwCapExMonth});
+        hwUnitsOwned += hwNewUnits;
+        hwTotalInvested += hwCapExMonth;
+      }
+      // Depreciation from all purchase batches
+      hwDep = hwPurchases.reduce((s, batch) => {
+        const monthsSince = m - batch.month;
+        if (monthsSince >= 0 && monthsSince < hwDepMonths) return s + batch.cost / hwDepMonths;
+        return s;
+      }, 0);
+    }
     const devC = m <= 6 ? budget.dev / 6 : budget.dev / totalMonths;
     const swC = budget.software / 12;
     const mktMultiplier = yr===1 ? 1 : yr===2 ? 1.5 : Math.min(yr*0.5+0.5, 3);
-    const mktY = p.marketingBudgetY1 * mktMultiplier;
-    const mktCalc = (p.llmStrategy==="own" && yr===1) ? 0 : mktY/12;
+    const mktOwnSuppress = (p.llmStrategy==="own" && yr===1) ? 0 : 1;
+    const mktSalesTeamMo = (salesTeamAnnual / 12) * mktMultiplier * mktOwnSuppress;
+    const mktDigitalAdsMo = (digitalAdsAnnual / 12) * mktMultiplier * mktOwnSuppress;
+    const mktEventsMo = (eventsAnnual / 12) * mktMultiplier * mktOwnSuppress;
+    const mktContentMo = (contentAnnual / 12) * mktMultiplier * mktOwnSuppress;
+    const mktAffiliateMo = (affiliateAnnual / 12) * mktMultiplier * mktOwnSuppress;
+    const mktCalc = mktSalesTeamMo + mktDigitalAdsMo + mktEventsMo + mktContentMo + mktAffiliateMo;
 
     const mkt = ovr.mkt != null ? ovr.mkt : mktCalc;
     const devFinal = ovr.dev != null ? ovr.dev : devC;
@@ -206,7 +245,7 @@ function computeModel(p, _skipSens = false) {
     const gp = rev - cogs;
 
     // CapEx
-    const capExHW = m === 1 ? budget.hardware : 0;
+    const capExHW = hwCapExMonth;
     const capExSW = (p.softwareCapex || 0) / totalMonths;
     const depreciation = hwDep + capExSW;
 
@@ -216,6 +255,9 @@ function computeModel(p, _skipSens = false) {
       revB, revP, revE, revSeats, revStor, totalRevenue: rev,
       salaryCost: sal, apiCost: apiFinal, hwDep, devCost: devFinal, swCost: swC, mktCost: mkt,
       paymentProcessing: payProc, supportCost: support, platformSw, internalSw,
+      hwUnitsOwned, hwNewUnits, hwTotalInvested,
+      mktSalesTeam: mktSalesTeamMo, mktDigitalAds: mktDigitalAdsMo, mktEvents: mktEventsMo,
+      mktContent: mktContentMo, mktAffiliate: mktAffiliateMo, mktBudgetY1Total: mktBudgetY1,
       salesOutreach: mkt*p.salesOutreachPct, lineAff: mkt*p.lineAffiliationPct,
       wom: mkt*p.wordOfMouthPct, content: mkt*p.contentMarketingPct,
       cogs, opex, totalCost: totalC, grossProfit: gp,
@@ -244,7 +286,7 @@ function computeModel(p, _skipSens = false) {
     ? loanAmt * monthlyLoanRate / (1 - Math.pow(1 + monthlyLoanRate, -loanTerm))
     : (loanAmt > 0 ? loanAmt / Math.max(loanTerm, 1) : 0);
 
-  let cash = p.raiseAmount, re = 0, totalEquityRaised = p.raiseAmount;
+  let cash = p.raiseAmount, re = 0, totalEquityRaised = p.raiseAmount, cumDepPost = 0;
   data.forEach((d,i) => {
     // Operating
     d.cashFromOperations = d.netIncome + d.depreciation;
@@ -275,7 +317,8 @@ function computeModel(p, _skipSens = false) {
     cash += d.cashFromOperations + d.cashFromInvesting + (i > 0 ? d.cashFromFinancing : d.debtBorrowed - d.debtRepaid - d.interestPaid);
     re += d.netIncome;
     d.cash = cash;
-    d.fixedAssets = Math.max(0, budget.hardware + (p.softwareCapex||0) - d.depreciation*(i+1));
+    cumDepPost += d.depreciation;
+    d.fixedAssets = Math.max(0, (d.hwTotalInvested || 0) + (p.softwareCapex || 0) - cumDepPost);
     d.totalAssets = cash + d.fixedAssets;
     d.equity = totalEquityRaised + re;
     d.retainedEarnings = re;
@@ -299,12 +342,21 @@ function computeModel(p, _skipSens = false) {
       newCustomers: yd.reduce((s,d)=>s+d.newCustomers,0),
       cash: last.cash,
       mkt: yd.reduce((s,d)=>s+d.mktCost,0),
+      mktSalesTeam: yd.reduce((s,d)=>s+d.mktSalesTeam,0),
+      mktDigitalAds: yd.reduce((s,d)=>s+d.mktDigitalAds,0),
+      mktEvents: yd.reduce((s,d)=>s+d.mktEvents,0),
+      mktContent: yd.reduce((s,d)=>s+d.mktContent,0),
+      mktAffiliate: yd.reduce((s,d)=>s+d.mktAffiliate,0),
       mrr: last.totalRevenue,
       cashFromOperations: yd.reduce((s,d)=>s+d.cashFromOperations,0),
       cashFromInvesting: yd.reduce((s,d)=>s+d.cashFromInvesting,0),
       cashFromFinancing: yd.reduce((s,d)=>s+d.cashFromFinancing,0),
       capex: yd.reduce((s,d)=>s+d.capExHW+d.capExSW,0),
       depreciation: yd.reduce((s,d)=>s+d.depreciation,0),
+      hwUnitsEoY: last.hwUnitsOwned || 0,
+      hwNewUnits: yd.reduce((s,d)=>s+(d.hwNewUnits||0),0),
+      hwCapex: yd.reduce((s,d)=>s+d.capExHW,0),
+      hwInvestmentTotal: last.hwTotalInvested || 0,
       interestPaid: yd.reduce((s,d)=>s+d.interestPaid,0),
       debtBorrowed: yd.reduce((s,d)=>s+d.debtBorrowed,0),
       debtRepaid: yd.reduce((s,d)=>s+d.debtRepaid,0),
@@ -405,7 +457,19 @@ function computeModel(p, _skipSens = false) {
     dcf: { fcfs, terminalValue, pvTerminal, sumPVFCFs, enterpriseValue, terminalPctOfTotal },
   };
 
-  return { data, annuals, capTable, sens, budget: fullBudget, apiReserveCalc, valuation, projYears };
+  // Use of Funds — auto-derived from Y1 actuals
+  const y1d = data.filter(d => d.year === 1);
+  const useOfFunds = {
+    development: y1d.reduce((s,d) => s + d.devCost, 0),
+    hardware: y1d.reduce((s,d) => s + d.capExHW, 0),
+    apiReserve: apiReserveCalc,
+    salaryOps: y1d.reduce((s,d) => s + d.salaryCost, 0),
+    software: y1d.reduce((s,d) => s + d.swCost, 0),
+    marketing: y1d.reduce((s,d) => s + d.mktCost, 0),
+  };
+  useOfFunds.buffer = Math.max(0, p.raiseAmount - Object.values(useOfFunds).reduce((s,v) => s+v, 0));
+
+  return { data, annuals, capTable, sens, budget: fullBudget, useOfFunds, apiReserveCalc, valuation, projYears };
 }
 
 // ============================================================
@@ -551,7 +615,7 @@ function PitchTab({model:m, params:p}) {
   const c = v => cv(v,p.exchangeRate,p.displayCurrency);
   const cur = p.displayCurrency;
   const ct = m.capTable;
-  const b = m.budget;
+  const b = m.useOfFunds;
   const N = m.projYears;
   const beM = m.data.findIndex(d=>d.ebitda>0);
   const last = m.data[m.data.length-1];
@@ -559,7 +623,6 @@ function PitchTab({model:m, params:p}) {
   const totalCostY1 = m.annuals[0].totalCost;
   const runway = Math.round(p.raiseAmount / (totalCostY1/12));
   const colors = ["var(--ac)","var(--gn)","var(--pp)","var(--yl)","#6366f1","#ec4899","#10b981","#f59e0b","#3b82f6","#8b5cf6"];
-  const mLabels = monthLabels(N);
 
   return (
     <div className="tc">
@@ -591,14 +654,14 @@ function PitchTab({model:m, params:p}) {
         </div>
         <div className="g2" style={{marginTop:12}}>
           <div>
-            <Bar data={m.data.map(d=>c(d.totalRevenue))} color="var(--gn)" h={90}/>
-            <div className="cl">{mLabels.map((l,i)=><span key={i}>{l}</span>)}</div>
-            <div style={{textAlign:"center",fontSize:11,color:"var(--td)",marginTop:4}}>Monthly Revenue</div>
+            <Bar data={m.annuals.map(a=>c(a.revenue))} color="var(--gn)" h={90}/>
+            <div className="cl">{m.annuals.map(a=><span key={a.year}>Y{a.year}</span>)}</div>
+            <div style={{textAlign:"center",fontSize:11,color:"var(--td)",marginTop:4}}>Annual Revenue</div>
           </div>
           <div>
-            <Bar data={m.data.map(d=>c(d.cash))} h={90}/>
-            <div className="cl">{mLabels.map((l,i)=><span key={i}>{l}</span>)}</div>
-            <div style={{textAlign:"center",fontSize:11,color:"var(--td)",marginTop:4}}>Cash Balance</div>
+            <Bar data={m.annuals.map(a=>c(a.cash))} h={90}/>
+            <div className="cl">{m.annuals.map(a=><span key={a.year}>Y{a.year}</span>)}</div>
+            <div style={{textAlign:"center",fontSize:11,color:"var(--td)",marginTop:4}}>Cash Balance (EoY)</div>
           </div>
         </div>
       </Card>
@@ -625,20 +688,19 @@ function PitchTab({model:m, params:p}) {
       <Card title="Use of Funds">
         <div className="g2">
           <Pie data={[
-            {label:"Development",value:b.dev,color:"#6366f1"},
-            {label:"LLM Hardware",value:b.hardware,color:"#f59e0b"},
+            {label:"Development",value:b.development,color:"#6366f1"},
+            {label:"Hardware",value:b.hardware,color:"#f59e0b"},
             {label:"API Reserve",value:b.apiReserve,color:"#10b981"},
             {label:"Salary & Ops",value:b.salaryOps,color:"#3b82f6"},
             {label:"Software",value:b.software,color:"#8b5cf6"},
             {label:"Marketing",value:b.marketing,color:"#ec4899"},
             {label:"Buffer",value:b.buffer,color:"#6b7280"},
           ].filter(i=>i.value>0)} size={170}/>
-          <Tbl headers={["Category","Amount","% of Total"]} rows={[
-            ...Object.entries({Development:b.dev,Hardware:b.hardware,"API Reserve":b.apiReserve,"Salary & Ops":b.salaryOps,Software:b.software,Marketing:b.marketing,Buffer:b.buffer}).filter(([,v])=>v>0).map(([k,v])=>{
-              const tot=Object.values(b).reduce((s,x)=>s+x,0);
-              return [k,fmt(c(v),cur),fmtP(v/tot)];
+          <Tbl headers={["Category","Amount","% of Raise"]} rows={[
+            ...Object.entries({Development:b.development,Hardware:b.hardware,"API Reserve":b.apiReserve,"Salary & Ops":b.salaryOps,Software:b.software,Marketing:b.marketing,Buffer:b.buffer}).filter(([,v])=>v>0).map(([k,v])=>{
+              return [k,fmt(c(v),cur),fmtP(v/p.raiseAmount)];
             }),
-            ["Total",fmt(c(Object.values(b).reduce((s,x)=>s+x,0)),cur),"100%"],
+            ["Total (Y1 Costs)",fmt(c(Object.values(b).reduce((s,x)=>s+x,0)),cur),""],
           ]} hl/>
         </div>
       </Card>
@@ -700,8 +762,7 @@ function OverviewTab({model:m, params:p}) {
   const N = m.projYears;
   const y1 = m.annuals[0];
   const lastA = m.annuals[N-1];
-  const b = m.budget;
-  const mLabels = monthLabels(N);
+  const b = m.useOfFunds;
   return (
     <div className="tc">
       <div className="st">Executive Dashboard — Law5</div>
@@ -710,16 +771,16 @@ function OverviewTab({model:m, params:p}) {
         {m.annuals.slice(1,3).map(a => <Metric key={a.year} label={`Year ${a.year} Revenue`} value={fmt(c(a.revenue),cur)} sub={`${fmtN(a.customers)} customers`} color="var(--gn)"/>)}
         <Metric label="Cash Runway" value={`${Math.round(p.raiseAmount/(y1.totalCost/12))} mo`} sub="At Y1 burn rate" color="var(--yl)"/>
         <Metric label={`Y${N} EBITDA`} value={fmt(c(lastA.ebitda),cur)} sub={lastA.ebitda>0?"Profitable":"Pre-profit"} color={lastA.ebitda>0?"var(--gn)":"var(--rd)"}/>
-        <Metric label="LLM Strategy" value={p.llmStrategy.toUpperCase()} sub={`HW: ${fmt(c(b.hardware),cur)} | API: ${fmt(c(b.apiReserve),cur)}`} color="var(--pp)"/>
+        <Metric label="Use of Funds" value={fmt(c(Object.values(b).reduce((s,v)=>s+v,0)),cur)} sub={`${p.llmStrategy.toUpperCase()} | HW: ${fmt(c(b.hardware),cur)} | API: ${fmt(c(b.apiReserve),cur)}`} color="var(--pp)"/>
       </div>
       <div className="g2">
-        <Card title={`Monthly Revenue (${N*12}mo)`}>
-          <Bar data={m.data.map(d=>c(d.totalRevenue))} color="var(--gn)" h={100}/>
-          <div className="cl">{mLabels.map((l,i)=><span key={i}>{l}</span>)}</div>
+        <Card title={`Annual Revenue (${N} Years)`}>
+          <Bar data={m.annuals.map(a=>c(a.revenue))} color="var(--gn)" h={100}/>
+          <div className="cl">{m.annuals.map(a=><span key={a.year}>Y{a.year}</span>)}</div>
         </Card>
-        <Card title="Cash Balance">
-          <Bar data={m.data.map(d=>c(d.cash))} h={100}/>
-          <div className="cl">{mLabels.map((l,i)=><span key={i}>{l}</span>)}</div>
+        <Card title="Cash Balance (EoY)">
+          <Bar data={m.annuals.map(a=>c(a.cash))} h={100}/>
+          <div className="cl">{m.annuals.map(a=><span key={a.year}>Y{a.year}</span>)}</div>
         </Card>
       </div>
       <Card title={`${N}-Year Summary`}>
@@ -734,10 +795,10 @@ function OverviewTab({model:m, params:p}) {
           yearRow("Cash", m.annuals, a => fmt(c(a.cash),cur)),
         ]} hl/>
       </Card>
-      <Card title={`Fund Allocation — ${p.llmStrategy.toUpperCase()}`}>
+      <Card title={`Use of Funds — Y1 (${p.llmStrategy.toUpperCase()})`}>
         <Pie data={[
-          {label:"Development",value:b.dev,color:"#6366f1"},
-          {label:"LLM Hardware",value:b.hardware,color:"#f59e0b"},
+          {label:"Development",value:b.development,color:"#6366f1"},
+          {label:"Hardware",value:b.hardware,color:"#f59e0b"},
           {label:"API Reserve",value:b.apiReserve,color:"#10b981"},
           {label:"Salary & Ops",value:b.salaryOps,color:"#3b82f6"},
           {label:"Software",value:b.software,color:"#8b5cf6"},
@@ -752,18 +813,40 @@ function OverviewTab({model:m, params:p}) {
 function RevenueTab({model:m,params:p,setParams:sp}) {
   const c=v=>cv(v,p.exchangeRate,p.displayCurrency); const cur=p.displayCurrency;
   const N = m.projYears;
+  const [viewYear,setViewYear]=useState(1);
   const yearEnds = m.annuals.map(a => yEnd(m.data, a.year));
   const lastYE = yearEnds[yearEnds.length-1];
   const tierPct=(d)=>{const t=d.totalCustomers||1;return {b:((d.bM+d.bA)/t*100).toFixed(1),p:((d.pM+d.pA)/t*100).toFixed(1),e:((d.eM+d.eA)/t*100).toFixed(1)};};
+  const YearBtns = () => (
+    <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+      {Array.from({length:N},(_,i)=>i+1).map(y=><button key={y} className="ct" style={{margin:0,padding:"4px 12px",background:viewYear===y?"var(--ac)":"var(--bg3)",color:viewYear===y?"#fff":"var(--tx)",border:viewYear===y?"none":"1px solid var(--bd)"}} onClick={()=>setViewYear(y)}>Y{y}</button>)}
+    </div>
+  );
   return (
     <div className="tc">
       <div className="st">Revenue Model</div>
       <div className="mg">
-        <Metric label="Basic" value={`$${p.basicMonthly}/mo`} sub={`Annual: $${p.basicAnnual}/mo`}/>
-        <Metric label="Pro" value={`$${p.proMonthly}/mo`} sub={`Annual: $${p.proAnnual}/mo`}/>
-        <Metric label="Enterprise" value={`$${p.enterpriseMonthly}/mo`} sub={`Annual: $${p.enterpriseAnnual}/mo`}/>
-        <Metric label="Storage" value={`$${p.storageTopupMonthly}/50GB`} sub={`${fmtP(p.storageAdoptionRate)} adopt`}/>
+        <Metric label="Basic" value={`${fmt(cur==="USD"?p.basicMonthly:p.basicMonthly*p.exchangeRate,cur)}/mo`} sub={`Annual: ${fmt(cur==="USD"?p.basicAnnual:p.basicAnnual*p.exchangeRate,cur)}/mo`}/>
+        <Metric label="Pro" value={`${fmt(cur==="USD"?p.proMonthly:p.proMonthly*p.exchangeRate,cur)}/mo`} sub={`Annual: ${fmt(cur==="USD"?p.proAnnual:p.proAnnual*p.exchangeRate,cur)}/mo`}/>
+        <Metric label="Enterprise" value={`${fmt(cur==="USD"?p.enterpriseMonthly:p.enterpriseMonthly*p.exchangeRate,cur)}/mo`} sub={`Annual: ${fmt(cur==="USD"?p.enterpriseAnnual:p.enterpriseAnnual*p.exchangeRate,cur)}/mo`}/>
+        <Metric label="Storage" value={`${fmt(cur==="USD"?p.storageTopupMonthly:p.storageTopupMonthly*p.exchangeRate,cur)}/50GB`} sub={`${fmtP(p.storageAdoptionRate)} adopt`}/>
       </div>
+
+      {/* Annual Revenue Summary */}
+      <Card title="Annual Revenue Summary">
+        <Tbl headers={yearHeaders(m.annuals)} rows={[
+          yearRow("Total Revenue", m.annuals, a => fmt(c(a.revenue),cur)),
+          yearRow("Revenue Growth", m.annuals, (a,i) => i===0?"—":fmtP(m.annuals[i-1].revenue>0?(a.revenue/m.annuals[i-1].revenue-1):0)),
+          yearRow("MRR (EoY)", m.annuals, a => fmt(c(yEnd(m.data,a.year).totalRevenue),cur)),
+          yearRow("MRR Growth", m.annuals, (a,i) => {const ye=yEnd(m.data,a.year).totalRevenue; const prev=i>0?yEnd(m.data,m.annuals[i-1].year).totalRevenue:0; return i===0?"—":prev>0?fmtP(ye/prev-1):"—";}),
+          yearRow("ARR (EoY MRR × 12)", m.annuals, a => fmt(c(yEnd(m.data,a.year).totalRevenue*12),cur)),
+          yearRow("ARPU/Mo (EoY)", m.annuals, a => {const ye=yEnd(m.data,a.year); return ye.totalCustomers>0?fmt(c(ye.totalRevenue/ye.totalCustomers),cur):"—";}),
+          yearRow("New Customers", m.annuals, a => fmtN(a.newCustomers)),
+          yearRow("Churned", m.annuals, (a,i) => {const prevEnd=i>0?m.annuals[i-1].customers:0; const churned=a.newCustomers-(a.customers-prevEnd); return churned>0?fmtN(churned):"—";}),
+          yearRow("End Customers", m.annuals, a => fmtN(a.customers)),
+        ]} hl/>
+      </Card>
+
       <Card title={`Customer Mix by Tier (End of Y${N})`}>
         <div className="g2">
           <Pie data={[
@@ -779,8 +862,17 @@ function RevenueTab({model:m,params:p,setParams:sp}) {
           ]} hl/>
         </div>
       </Card>
-      <Card title="Monthly Revenue — Year 1">
-        <Tbl headers={["Month","Basic","Pro","Ent","Seats","Storage","Total","Cust"]} rows={m.data.filter(d=>d.year===1).map(d=>[d.label,fmt(c(d.revB),cur),fmt(c(d.revP),cur),fmt(c(d.revE),cur),fmt(c(d.revSeats),cur),fmt(c(d.revStor),cur),fmt(c(d.totalRevenue),cur),fmtN(d.totalCustomers)])}/>
+      <Card title={`Monthly Revenue — Year ${viewYear}`}>
+        <YearBtns/>
+        {(()=>{
+          const yd=m.data.filter(d=>d.year===viewYear);
+          const totB=yd.reduce((s,d)=>s+d.revB,0), totP=yd.reduce((s,d)=>s+d.revP,0), totE=yd.reduce((s,d)=>s+d.revE,0);
+          const totS=yd.reduce((s,d)=>s+d.revSeats,0), totSt=yd.reduce((s,d)=>s+d.revStor,0), totR=yd.reduce((s,d)=>s+d.totalRevenue,0);
+          return <Tbl headers={["Month","Basic","Pro","Ent","Seats","Storage","Total","Cust"]} rows={[
+            ...yd.map(d=>[d.label,fmt(c(d.revB),cur),fmt(c(d.revP),cur),fmt(c(d.revE),cur),fmt(c(d.revSeats),cur),fmt(c(d.revStor),cur),fmt(c(d.totalRevenue),cur),fmtN(d.totalCustomers)]),
+            [`Total Y${viewYear}`,fmt(c(totB),cur),fmt(c(totP),cur),fmt(c(totE),cur),fmt(c(totS),cur),fmt(c(totSt),cur),fmt(c(totR),cur),""],
+          ]} hl/>;
+        })()}
       </Card>
       <Card title="ARR Progression">
         <Tbl headers={yearHeaders(m.annuals)} rows={[
@@ -821,8 +913,8 @@ function CostTab({model:m,params:p,setParams:sp}) {
   const avgChurn=(p.basicChurnMonthly+p.proChurnMonthly)/2;
   const ltv=avgChurn>0?arpu/avgChurn:0;
   const budget = p.llmBudget || LLM_PRESETS[p.llmStrategy];
-  const apiReserve = m.apiReserveCalc;
-  const fullBudget = m.budget;
+  const uof = m.useOfFunds;
+  const uofTotal = Object.values(uof).reduce((s,v)=>s+v,0);
 
   const updateBudget=(key,val)=>{
     sp(pr=>({...pr, llmBudget:{...(pr.llmBudget||LLM_PRESETS[pr.llmStrategy]),[key]:parseFloat(val)||0}}));
@@ -839,8 +931,6 @@ function CostTab({model:m,params:p,setParams:sp}) {
       return {...pr,costOverrides:ovr};
     });
   };
-  const budgetTotal = Object.values(fullBudget).reduce((s,v)=>s+v,0);
-
   const N = m.projYears;
   // Aggregate COGS/OpEx for each year
   const yrData = Array.from({length: N}, (_, yi) => {
@@ -964,7 +1054,13 @@ function CostTab({model:m,params:p,setParams:sp}) {
           ]} hl/>
         </div>
         <div style={{marginTop:12}}>
-          <PI label="Marketing Budget Y1 (THB)" value={p.marketingBudgetY1} onChange={v=>u("marketingBudgetY1",v)} step={100000}/>
+          <div className="pr">
+            <label className="pl">Marketing Budget Y1 (auto)</label>
+            <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:"var(--gn)",fontWeight:600}}>{fmt(c(m.data[0].mktBudgetY1Total),cur)}</span>
+          </div>
+          <div style={{fontSize:10,color:"var(--td)",marginTop:-4,marginBottom:6,paddingLeft:4}}>
+            Built bottom-up in Marketing tab
+          </div>
           <PI label="Outsource Dev" value={p.outsourceDevMonthly} onChange={v=>u("outsourceDevMonthly",v)} step={5000}/>
           <PI label="Outsource Accounting" value={p.outsourceAccountingMonthly} onChange={v=>u("outsourceAccountingMonthly",v)} step={1000}/>
           <PI label="Office Rent" value={p.officeRent} onChange={v=>u("officeRent",v)} step={1000}/>
@@ -973,8 +1069,8 @@ function CostTab({model:m,params:p,setParams:sp}) {
         </div>
       </Card>
 
-      {/* LLM Strategy & Budget */}
-      <Card title="LLM Strategy & Budget">
+      {/* Use of Funds (Y1) */}
+      <Card title="Use of Funds — Year 1">
         <div style={{display:"flex",gap:8,marginBottom:14}}>
           {["api","own","hybrid"].map(s=>(
             <button key={s} className="ct" style={{margin:0,padding:"6px 16px",background:p.llmStrategy===s?"var(--ac)":"var(--bg3)",color:p.llmStrategy===s?"#fff":"var(--tx)",border:p.llmStrategy===s?"none":"1px solid var(--bd)"}} onClick={()=>applyPreset(s)}>{s.toUpperCase()}</button>
@@ -982,37 +1078,66 @@ function CostTab({model:m,params:p,setParams:sp}) {
         </div>
         <div className="g2">
           <div>
-            <PI label="Development (THB)" value={budget.dev} onChange={v=>updateBudget("dev",v)} step={100000}/>
-            <PI label="Hardware (THB)" value={budget.hardware} onChange={v=>updateBudget("hardware",v)} step={100000}/>
-            <div className="pr">
-              <label className="pl">API Reserve (auto)</label>
-              <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:"var(--gn)",fontWeight:600}}>{fmtF(apiReserve,cur)}</span>
-            </div>
-            <div style={{fontSize:10,color:"var(--td)",marginTop:-4,marginBottom:6,paddingLeft:4}}>
-              = {fmtN(m.data[11].totalCustomers)} users x ฿{fmtN(p.apiCostPerUser)}/user x {p.apiReserveMonths} mo
-            </div>
-            <PI label="Reserve Months" value={p.apiReserveMonths||6} onChange={v=>u("apiReserveMonths",v)} step={1} min={1} max={24}/>
-            <PI label="Salary & Ops (THB)" value={budget.salaryOps} onChange={v=>updateBudget("salaryOps",v)} step={100000}/>
-            <PI label="Software (THB)" value={budget.software} onChange={v=>updateBudget("software",v)} step={100000}/>
-            <PI label="Marketing (THB)" value={budget.marketing} onChange={v=>updateBudget("marketing",v)} step={100000}/>
-            <PI label="Buffer (THB)" value={budget.buffer} onChange={v=>updateBudget("buffer",v)} step={100000}/>
-            <div style={{borderTop:"2px solid var(--ac)",paddingTop:8,marginTop:8}}>
-              <div className="pr"><label className="pl" style={{fontWeight:700,color:"var(--tx)"}}>Total LLM Budget</label><span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:700,color:"var(--ac)"}}>{fmt(c(budgetTotal),cur)}</span></div>
+            <PI label="Development Budget (THB)" value={budget.dev} onChange={v=>updateBudget("dev",v)} step={100000}/>
+            <PI label="Software Budget (THB)" value={budget.software} onChange={v=>updateBudget("software",v)} step={100000}/>
+            <PI label="API Reserve Months" value={p.apiReserveMonths||6} onChange={v=>u("apiReserveMonths",v)} step={1} min={1} max={24}/>
+            <div style={{borderTop:"1px solid var(--bd)",marginTop:8,paddingTop:8}}>
+              <div style={{fontSize:11,color:"var(--td)",marginBottom:6,textTransform:"uppercase",letterSpacing:".5px",fontWeight:600}}>Auto-Derived from Y1 Costs</div>
+              {[
+                ["Development", uof.development, "#6366f1"],
+                ["Hardware CapEx", uof.hardware, "#f59e0b"],
+                ["API Reserve", uof.apiReserve, "#10b981"],
+                ["Salary & Ops", uof.salaryOps, "#3b82f6"],
+                ["Software", uof.software, "#8b5cf6"],
+                ["Marketing", uof.marketing, "#ec4899"],
+                ["Buffer", uof.buffer, "#6b7280"],
+              ].map(([label, val, color]) => val > 0 ? (
+                <div key={label} className="pr">
+                  <label className="pl" style={{display:"flex",alignItems:"center",gap:6}}><div style={{width:8,height:8,borderRadius:2,background:color}}/>{label}</label>
+                  <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:"var(--td)"}}>{fmt(c(val),cur)}</span>
+                </div>
+              ) : null)}
+              <div style={{borderTop:"2px solid var(--ac)",paddingTop:8,marginTop:8}}>
+                <div className="pr"><label className="pl" style={{fontWeight:700,color:"var(--tx)"}}>Total Y1 Costs</label><span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:700,color:"var(--ac)"}}>{fmt(c(uofTotal),cur)}</span></div>
+                <div className="pr"><label className="pl">Raise Amount</label><span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:"var(--gn)"}}>{fmt(c(p.raiseAmount),cur)}</span></div>
+              </div>
             </div>
           </div>
           <div>
             <Pie data={[
-              {label:"Development",value:fullBudget.dev,color:"#6366f1"},
-              {label:"Hardware",value:fullBudget.hardware,color:"#f59e0b"},
-              {label:"API Reserve",value:fullBudget.apiReserve,color:"#10b981"},
-              {label:"Salary & Ops",value:fullBudget.salaryOps,color:"#3b82f6"},
-              {label:"Software",value:fullBudget.software,color:"#8b5cf6"},
-              {label:"Marketing",value:fullBudget.marketing,color:"#ec4899"},
-              {label:"Buffer",value:fullBudget.buffer,color:"#6b7280"},
+              {label:"Development",value:uof.development,color:"#6366f1"},
+              {label:"Hardware",value:uof.hardware,color:"#f59e0b"},
+              {label:"API Reserve",value:uof.apiReserve,color:"#10b981"},
+              {label:"Salary & Ops",value:uof.salaryOps,color:"#3b82f6"},
+              {label:"Software",value:uof.software,color:"#8b5cf6"},
+              {label:"Marketing",value:uof.marketing,color:"#ec4899"},
+              {label:"Buffer",value:uof.buffer,color:"#6b7280"},
             ].filter(i=>i.value>0)} size={170}/>
           </div>
         </div>
       </Card>
+
+      {/* Hardware Fleet — Mac Studio M4 */}
+      {p.llmStrategy !== "api" && <Card title="Hardware Fleet — Mac Studio M4">
+        <div className="mg" style={{gridTemplateColumns:"repeat(4,1fr)"}}>
+          <Metric label="Unit Cost" value={fmt(c(p.hwUnitCost||250000),cur)} sub="Mac Studio M4"/>
+          <Metric label="Users/Machine" value={p.hwUsersPerUnit||30} sub="capacity"/>
+          <Metric label={`Y${N} Total Units`} value={m.annuals[N-1].hwUnitsEoY} color="var(--ac)"/>
+          <Metric label="Total Investment" value={fmt(c(m.annuals[N-1].hwInvestmentTotal),cur)} color="var(--pp)"/>
+        </div>
+        <Tbl headers={["", ...m.annuals.map(a=>`Year ${a.year}`)]} rows={[
+          yearRow("Units EoY", m.annuals, a => a.hwUnitsEoY),
+          yearRow("New Purchased", m.annuals, a => a.hwNewUnits),
+          yearRow("CapEx", m.annuals, a => fmt(c(a.hwCapex),cur)),
+          yearRow("HW Depreciation", m.annuals, a => fmt(c(a.depreciation),cur)),
+          yearRow("Cumulative Investment", m.annuals, a => fmt(c(a.hwInvestmentTotal),cur)),
+        ]} hl/>
+        <div style={{marginTop:12}}>
+          <PI label="Unit Cost (THB)" value={p.hwUnitCost||250000} onChange={v=>u("hwUnitCost",v)} step={10000}/>
+          <PI label="Users per Machine" value={p.hwUsersPerUnit||30} onChange={v=>u("hwUsersPerUnit",v)} step={5} min={1}/>
+          <PI label="Depreciation (months)" value={p.hwDepreciationMonths||36} onChange={v=>u("hwDepreciationMonths",v)} step={6} min={12} max={60}/>
+        </div>
+      </Card>}
 
       {/* Unit Economics */}
       <Card title="Unit Economics (Month 12)">
@@ -1100,26 +1225,80 @@ function MarketingTab({model:m,params:p,setParams:sp}) {
   const u=(k,v)=>sp(pr=>({...pr,[k]:v}));
   const vis=p.websiteVisitors; const leads=Math.round(vis*p.visitorToLeadRate);
   const trials=Math.round(leads*p.leadToTrialRate); const cust=Math.round(trials*p.trialToCustomerRate);
+
+  // Bottom-up Y1 totals
+  const salesTeamAnn = p.includeSalesInMktBudget ? (p.salesRepsY1||0) * (p.salesRepCostMonthly||0) * 12 : 0;
+  const digitalAdsAnn = (p.digitalAdsBudgetY1||0) * 12;
+  const eventsAnn = p.eventsBudgetY1||0;
+  const contentAnn = p.contentBudgetY1||0;
+  const affiliateAnn = p.affiliateBudgetY1||0;
+  const totalMktY1 = salesTeamAnn + digitalAdsAnn + eventsAnn + contentAnn + affiliateAnn;
+
+  const pieData = [
+    {label:"Sales Team",value:salesTeamAnn,color:"#3b82f6"},
+    {label:"Digital Ads",value:digitalAdsAnn,color:"#6366f1"},
+    {label:"Events",value:eventsAnn,color:"#f59e0b"},
+    {label:"Content",value:contentAnn,color:"#8b5cf6"},
+    {label:"Affiliates",value:affiliateAnn,color:"#10b981"},
+  ].filter(d=>d.value>0);
+
   return (
     <div className="tc">
       <div className="st">Marketing Model</div>
-      <Card title="Budget & Channel Allocation">
+
+      {/* Bottom-Up Budget */}
+      <Card title="Marketing Budget — Bottom-Up">
         <div className="g2">
           <div>
-            <PI label="Y1 Budget (THB)" value={p.marketingBudgetY1} onChange={v=>u("marketingBudgetY1",v)} step={100000}/>
+            <PI label="Digital Ads (THB/mo)" value={p.digitalAdsBudgetY1||0} onChange={v=>u("digitalAdsBudgetY1",v)} step={10000}/>
+            <PI label="Events/Conferences (THB/yr)" value={p.eventsBudgetY1||0} onChange={v=>u("eventsBudgetY1",v)} step={50000}/>
+            <PI label="Content Creation (THB/yr)" value={p.contentBudgetY1||0} onChange={v=>u("contentBudgetY1",v)} step={50000}/>
+            <PI label="LINE Affiliates (THB/yr)" value={p.affiliateBudgetY1||0} onChange={v=>u("affiliateBudgetY1",v)} step={50000}/>
+            <div className="pr">
+              <label className="pl">Sales Team (auto)</label>
+              <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:"var(--td)"}}>{fmt(c(salesTeamAnn),cur)}/yr</span>
+            </div>
+            <div style={{fontSize:10,color:"var(--td)",marginTop:-4,marginBottom:8,paddingLeft:4}}>
+              = {p.salesRepsY1} reps x {fmtF(p.salesRepCostMonthly)} x 12 mo
+            </div>
+            <div style={{borderTop:"2px solid var(--ac)",paddingTop:8,marginTop:8}}>
+              <div className="pr"><label className="pl" style={{fontWeight:700,color:"var(--tx)"}}>Total Marketing Y1</label><span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:700,color:"var(--ac)"}}>{fmt(c(totalMktY1),cur)}</span></div>
+            </div>
+          </div>
+          <Pie data={pieData} size={170}/>
+        </div>
+      </Card>
+
+      {/* Marketing Spend by Year */}
+      <Card title="Marketing Spend by Year">
+        <Tbl headers={yearHeaders(m.annuals)} rows={[
+          yearRow("Sales Team", m.annuals, a => fmt(c(a.mktSalesTeam),cur)),
+          yearRow("Digital Ads", m.annuals, a => fmt(c(a.mktDigitalAds),cur)),
+          yearRow("Events", m.annuals, a => fmt(c(a.mktEvents),cur)),
+          yearRow("Content", m.annuals, a => fmt(c(a.mktContent),cur)),
+          yearRow("Affiliates", m.annuals, a => fmt(c(a.mktAffiliate),cur)),
+          yearRow("Total Marketing", m.annuals, a => fmt(c(a.mkt),cur)),
+        ]} hl/>
+      </Card>
+
+      {/* Channel Distribution */}
+      <Card title="Channel Distribution %">
+        <div className="g2">
+          <div>
             <PI label="Sales Outreach %" value={p.salesOutreachPct} onChange={v=>u("salesOutreachPct",v)} step={0.05} max={1}/>
             <PI label="LINE Affiliation %" value={p.lineAffiliationPct} onChange={v=>u("lineAffiliationPct",v)} step={0.05} max={1}/>
             <PI label="Word of Mouth %" value={p.wordOfMouthPct} onChange={v=>u("wordOfMouthPct",v)} step={0.05} max={1}/>
             <PI label="Content Marketing %" value={p.contentMarketingPct} onChange={v=>u("contentMarketingPct",v)} step={0.05} max={1}/>
           </div>
           <Pie data={[
-            {label:`Sales (${fmt(c(p.marketingBudgetY1*p.salesOutreachPct),cur)})`,value:p.salesOutreachPct,color:"#3b82f6"},
-            {label:`LINE (${fmt(c(p.marketingBudgetY1*p.lineAffiliationPct),cur)})`,value:p.lineAffiliationPct,color:"#10b981"},
-            {label:`WoM (${fmt(c(p.marketingBudgetY1*p.wordOfMouthPct),cur)})`,value:p.wordOfMouthPct,color:"#f59e0b"},
-            {label:`Content (${fmt(c(p.marketingBudgetY1*p.contentMarketingPct),cur)})`,value:p.contentMarketingPct,color:"#8b5cf6"},
+            {label:`Sales (${fmtP(p.salesOutreachPct)})`,value:p.salesOutreachPct,color:"#3b82f6"},
+            {label:`LINE (${fmtP(p.lineAffiliationPct)})`,value:p.lineAffiliationPct,color:"#10b981"},
+            {label:`WoM (${fmtP(p.wordOfMouthPct)})`,value:p.wordOfMouthPct,color:"#f59e0b"},
+            {label:`Content (${fmtP(p.contentMarketingPct)})`,value:p.contentMarketingPct,color:"#8b5cf6"},
           ]} size={160}/>
         </div>
       </Card>
+
       <Card title="Conversion Funnel — Drives Revenue">
         <div className="g2">
           <div>
@@ -1531,7 +1710,7 @@ function ParamsTab({params:p,setParams:sp}) {
   const rates = p.growthRates || {};
   const secs=[
     {t:"Currency & Valuation",f:[{k:"exchangeRate",l:"THB/USD Rate",s:0.5}]},
-    {t:"LLM Strategy",f:[{k:"llmStrategy",l:"Strategy",type:"select",opts:["api","own","hybrid"]},{k:"apiCostPerUser",l:"API Cost/User/Mo (THB)",s:10}]},
+    {t:"LLM / Infra Strategy",f:[{k:"llmStrategy",l:"Strategy",type:"select",opts:["api","own","hybrid"]},{k:"apiCostPerUser",l:"API Cost/User/Mo (THB)",s:10}]},
     {t:"Pricing (USD/mo)",f:[{k:"basicMonthly",l:"Basic Monthly",s:1},{k:"basicAnnual",l:"Basic Ann/Mo",s:1},{k:"proMonthly",l:"Pro Monthly",s:1},{k:"proAnnual",l:"Pro Ann/Mo",s:1},{k:"enterpriseMonthly",l:"Enterprise Monthly",s:1},{k:"enterpriseAnnual",l:"Enterprise Ann/Mo",s:1},{k:"storageTopupMonthly",l:"Storage USD/50GB",s:1}]},
     {t:"Acquisition",f:[{k:"revenueStartMonth",l:"Revenue Start Month",s:1,mn:1,mx:12},{k:"tierSplitBasic",l:"Basic Split %",s:0.05,mx:1},{k:"tierSplitPro",l:"Pro Split %",s:0.05,mx:1},{k:"tierSplitEnterprise",l:"Ent Split %",s:0.05,mx:1},{k:"y1AnnualRatio",l:"Annual Ratio",s:0.05,mx:1}]},
     {t:"Churn",f:[{k:"basicChurnMonthly",l:"Basic/Mo",s:0.01,mx:1},{k:"proChurnMonthly",l:"Pro/Mo",s:0.01,mx:1},{k:"enterpriseChurnMonthly",l:"Ent/Mo",s:0.01,mx:1}]},
@@ -1577,6 +1756,14 @@ export default function App() {
         if (parsed.y3GrowthRate != null && !parsed.growthRates) gr.y3 = parsed.y3GrowthRate;
         const merged = { ...DEFAULT_PARAMS, ...parsed, llmBudget: { ...DEFAULT_LLM_BUDGET, ...(parsed.llmBudget || {}) }, growthRates: gr };
         delete merged.y2GrowthRate; delete merged.y3GrowthRate;
+        // Migrate old flat marketingBudgetY1 to bottom-up components
+        if (parsed.marketingBudgetY1 != null && parsed.digitalAdsBudgetY1 == null) {
+          const oldBudget = parsed.marketingBudgetY1;
+          merged.digitalAdsBudgetY1 = Math.round(oldBudget * 0.30 / 12); // 30% → monthly
+          merged.eventsBudgetY1 = Math.round(oldBudget * 0.15);
+          merged.contentBudgetY1 = Math.round(oldBudget * 0.10);
+          merged.affiliateBudgetY1 = Math.round(oldBudget * 0.15);
+        }
         return merged;
       }
     } catch (e) {}
@@ -1629,18 +1816,19 @@ export default function App() {
         [data-theme="light"]{--bg:#f0f2f7;--bg2:#ffffff;--bg3:#e8eaf2;--bd:#c8cdd8;--tx:#1a1d2e;--td:#5f6780;--ac:#4f6df5;--gn:#059669;--rd:#dc2626;--yl:#d97706;--pp:#7c3aed}
         *{margin:0;padding:0;box-sizing:border-box}
         body,#root{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--tx);min-height:100vh}
-        .app{display:flex;min-height:100vh;color:var(--tx);background:var(--bg)}
-        .sb{width:220px;background:var(--bg2);border-right:1px solid var(--bd);padding:16px 0;flex-shrink:0;position:sticky;top:0;height:100vh;overflow-y:auto}
-        .sb-logo{padding:0 16px 16px;border-bottom:1px solid var(--bd);margin-bottom:8px}
-        .sb-logo h1{font-size:24px;font-weight:700;background:linear-gradient(135deg,var(--ac),var(--pp));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-        .sb-logo p{font-size:10px;color:var(--td);margin-top:2px;text-transform:uppercase;letter-spacing:1.5px}
-        .ni{display:flex;align-items:center;gap:8px;padding:10px 16px;font-size:13px;color:var(--td);cursor:pointer;border-left:3px solid transparent;transition:all .15s}
+        .app{display:flex;flex-direction:column;min-height:100vh;color:var(--tx);background:var(--bg)}
+        .sb{background:var(--bg2);border-bottom:1px solid var(--bd);padding:0 16px;flex-shrink:0;position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:0;overflow-x:auto;scrollbar-width:none}
+        .sb::-webkit-scrollbar{display:none}
+        .sb-logo{padding:8px 12px 8px 0;border-bottom:none;margin-bottom:0;flex-shrink:0;display:flex;align-items:center;gap:8px;border-right:1px solid var(--bd);margin-right:8px}
+        .sb-logo h1{font-size:18px;font-weight:700;background:linear-gradient(135deg,var(--ac),var(--pp));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+        .sb-logo p{font-size:9px;color:var(--td);margin-top:0;text-transform:uppercase;letter-spacing:1px}
+        .ni{display:flex;align-items:center;gap:4px;padding:10px 10px;font-size:12px;color:var(--td);cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;white-space:nowrap;flex-shrink:0}
         .ni:hover{background:var(--bg3);color:var(--tx)}
-        .ni.ac{background:var(--bg3);color:var(--ac);border-left-color:var(--ac);font-weight:600}
-        .ct{margin:8px 16px;padding:8px 12px;background:var(--bg3);border:1px solid var(--bd);border-radius:8px;color:var(--tx);font-size:12px;cursor:pointer;text-align:center;font-family:'DM Sans',sans-serif;transition:all .15s}
+        .ni.ac{color:var(--ac);border-bottom-color:var(--ac);font-weight:600;background:transparent}
+        .ct{margin:0;padding:6px 10px;background:var(--bg3);border:1px solid var(--bd);border-radius:6px;color:var(--tx);font-size:11px;cursor:pointer;text-align:center;font-family:'DM Sans',sans-serif;transition:all .15s;flex-shrink:0;white-space:nowrap}
         .ct:hover{border-color:var(--ac);background:var(--ac);color:#fff}
-        .mn{flex:1;padding:24px 32px 80px;overflow-y:auto;max-height:100vh;position:relative}
-        .tc{max-width:1200px}
+        .mn{flex:1;padding:24px 32px 80px;overflow-y:auto;position:relative}
+        .tc{max-width:100%}
         .st{font-size:20px;font-weight:700;margin-bottom:20px;letter-spacing:-.3px;color:var(--tx)}
         .mg{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:18px}
         .mc{background:var(--bg2);border:1px solid var(--bd);border-radius:12px;padding:16px}
@@ -1668,10 +1856,10 @@ export default function App() {
         select.pi option{background:var(--bg2);color:var(--tx)}
         .del-btn{background:transparent;border:none;color:var(--rd);cursor:pointer;font-size:14px;padding:2px 6px;border-radius:4px;line-height:1}
         .del-btn:hover{background:var(--rd);color:#fff}
-        .sb-info{padding:12px 16px;font-size:10px;color:var(--td);line-height:1.6;border-top:1px solid var(--bd);margin-top:8px}
+        .sb-info{padding:0 12px;font-size:9px;color:var(--td);line-height:1.4;border-left:1px solid var(--bd);margin-left:8px;flex-shrink:0;white-space:nowrap}
 
         /* Floating save bar at bottom of main content */
-        .float-save{position:fixed;bottom:0;right:0;left:220px;background:var(--bg2);border-top:1px solid var(--bd);padding:10px 32px;display:flex;align-items:center;gap:12px;z-index:100;box-shadow:0 -4px 20px rgba(0,0,0,.15);animation:slideUp .2s ease}
+        .float-save{position:fixed;bottom:0;right:0;left:0;background:var(--bg2);border-top:1px solid var(--bd);padding:10px 32px;display:flex;align-items:center;gap:12px;z-index:100;box-shadow:0 -4px 20px rgba(0,0,0,.15);animation:slideUp .2s ease}
         @keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
         .float-save .save-btn{padding:8px 24px;border-radius:8px;font-size:13px;font-family:'DM Sans',sans-serif;cursor:pointer;font-weight:600;border:none;transition:all .15s}
         .float-save .save-btn.primary{background:var(--gn);color:#fff}
@@ -1681,25 +1869,21 @@ export default function App() {
         .dirty-dot{width:8px;height:8px;border-radius:50%;background:var(--yl);display:inline-block;animation:pulse 1.5s infinite}
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
 
-        @media(max-width:768px){.app{flex-direction:column}.sb{width:100%;height:auto;position:relative;display:flex;flex-wrap:wrap;padding:8px;gap:2px}.sb-logo{padding:0 8px 8px;width:100%}.ni{padding:6px 10px;font-size:11px;border-left:none}.mn{padding:16px 16px 80px}.g2{grid-template-columns:1fr}.pg{grid-template-columns:1fr}.float-save{left:0}}
+        @media(max-width:768px){.sb{padding:0 8px}.sb-logo{display:none}.sb-info{display:none}.ni{padding:8px 8px;font-size:11px}.ni span{display:none}.mn{padding:16px 16px 80px}.g2{grid-template-columns:1fr}.pg{grid-template-columns:1fr}}
       `}</style>
       <div className="app" data-theme={theme}>
         <nav className="sb">
           <div className="sb-logo">
-            <h1>LAW5</h1>
-            <p>Financial Model 2025-{2024 + (p.projectionYears || 5)}</p>
+            <div><h1>LAW5</h1><p>Financial Model</p></div>
           </div>
           {TABS.map(t=>(
             <div key={t.id} className={`ni${tab===t.id?" ac":""}`} onClick={()=>setTab(t.id)}>
-              <span style={{fontSize:15,width:20,textAlign:"center"}}>{t.icon}</span>{t.label}
+              <span style={{fontSize:13}}>{t.icon}</span>{t.label}
             </div>
           ))}
-          <button className="ct" onClick={toggle}>{p.displayCurrency==="THB"?"THB to USD":"USD to THB"}</button>
-          <button className="ct" onClick={toggleTheme}>{theme==="dark"?"☀️ Light Mode":"🌙 Dark Mode"}</button>
-          <div className="sb-info">
-            All projections are estimates.<br/>
-            Currency: {p.displayCurrency} ({p.exchangeRate} THB/USD)
-          </div>
+          <div style={{flex:1}}/>
+          <button className="ct" onClick={toggle}>{p.displayCurrency==="THB"?"THB→USD":"USD→THB"}</button>
+          <button className="ct" style={{marginLeft:4}} onClick={toggleTheme}>{theme==="dark"?"☀️":"🌙"}</button>
         </nav>
         <main className="mn">
           {renderTab()}
